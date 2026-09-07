@@ -1,0 +1,2 @@
+"""CampusPulse Backend Application Package."""
+
