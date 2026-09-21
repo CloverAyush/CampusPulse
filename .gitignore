@@ -1,31 +1,41 @@
 # Dependencies
 node_modules/
-backend/venv/
 .venv/
+venv/
+backend/.venv/
 
-# Environment Variables
+# Environment files. Only the .env.example templates are committed; a real .env
+# never is. The key that used to sit in the committed example has been revoked --
+# see SECURITY.md.
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+!.env.example
+!**/.env.example
 
-# Databases & Cache
+# Databases
 *.db
 *.sqlite
 *.sqlite3
-__pycache__/
-*.pyc
-.pytest_cache/
 
-# Next.js build
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Next.js
 frontend/.next/
 frontend/out/
 frontend/build/
+frontend/.turbo/
+*.tsbuildinfo
 
-# IDE & OS
+# Tooling and OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
+coverage/
+.coverage
+htmlcov/

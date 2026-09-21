@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 from logging.config import fileConfig
@@ -9,7 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.config import settings
 from app.database import Base
-import app.models  # load all models for metadata
+
+# Imported for its side effect: registers every model class on Base.metadata so
+# autogenerate can see the full schema.
+importlib.import_module("app.models")
 
 config = context.config
 

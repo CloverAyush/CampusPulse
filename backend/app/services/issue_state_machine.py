@@ -1,26 +1,105 @@
 import json
-from typing import Optional, List, Dict, Any
+import logging
+from typing import Any, Dict, Optional, Tuple
+
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from fastapi import HTTPException, status
+
+from app.config import settings
+from app.errors import (
+    ConflictError,
+    InvalidTransitionError,
+    NotFoundError,
+    PermissionDeniedError,
+    ValidationError,
+)
 from app.models.enums import (
+    EvidenceType,
     IssueStatus,
     ReportStatus,
     TimelineEventType,
-    EvidenceType,
+    UserRole,
     VerificationStatus,
-    UserRole
 )
-from app.models.user import User
+from app.models.escalation import Escalation
 from app.models.issue import Issue
-from app.models.report import Report
 from app.models.issue_type import IssueType
 from app.models.location import Location
-from app.models.escalation import Escalation
+from app.models.report import Report
 from app.models.resolution_evidence import ResolutionEvidence
-from app.models.verification import Verification
 from app.models.timeline import TimelineEvent
-from app.services.routing import resolve_handler_deterministically
-from app.services.notification_service import notify_user, notify_affected_students
+from app.models.user import User
+from app.models.verification import Verification
+from app.services.notification_service import notify_affected_students, notify_user
+from app.services.routing import find_admins, resolve_handler
+
+logger = logging.getLogger(__name__)
+
+ACTIVE_STATUSES = (
+    IssueStatus.OPEN,
+    IssueStatus.IN_PROGRESS,
+    IssueStatus.ESCALATED,
+    IssueStatus.REOPENED,
+    IssueStatus.RESOLVED_PENDING_VERIFICATION,
+)
+
+# The complete set of legal moves. Every transition in this module is checked against
+# this table, so an illegal move fails the same way regardless of which caller tried it.
+ALLOWED_TRANSITIONS: Dict[IssueStatus, set] = {
+    IssueStatus.OPEN: {IssueStatus.IN_PROGRESS, IssueStatus.ESCALATED,
+                       IssueStatus.RESOLVED_PENDING_VERIFICATION, IssueStatus.VERIFIED_CLOSED},
+    IssueStatus.IN_PROGRESS: {IssueStatus.ESCALATED, IssueStatus.RESOLVED_PENDING_VERIFICATION,
+                              IssueStatus.VERIFIED_CLOSED},
+    IssueStatus.REOPENED: {IssueStatus.IN_PROGRESS, IssueStatus.ESCALATED,
+                           IssueStatus.RESOLVED_PENDING_VERIFICATION, IssueStatus.VERIFIED_CLOSED},
+    IssueStatus.ESCALATED: {IssueStatus.IN_PROGRESS, IssueStatus.RESOLVED_PENDING_VERIFICATION,
+                            IssueStatus.VERIFIED_CLOSED},
+    IssueStatus.RESOLVED_PENDING_VERIFICATION: {IssueStatus.VERIFIED_CLOSED, IssueStatus.REOPENED},
+    IssueStatus.VERIFIED_CLOSED: set(),
+}
+
+
+def _assert_transition(issue: Issue, target: IssueStatus, action: str) -> None:
+    if target not in ALLOWED_TRANSITIONS[issue.status]:
+        raise InvalidTransitionError(
+            f"Cannot {action} an issue that is currently {issue.status.value.replace('_', ' ').lower()}."
+        )
+
+
+def _lock_issue(db: Session, issue_id: int) -> Issue:
+    """Serialise concurrent handler actions on one issue. SQLite has a single writer
+    so its transaction already provides this; other backends need an explicit lock."""
+    query = db.query(Issue).filter(Issue.id == issue_id)
+    if not settings.is_sqlite:
+        query = query.with_for_update()
+
+    issue = query.first()
+    if not issue:
+        raise NotFoundError("Issue not found")
+    return issue
+
+
+def _current_resolution_round(db: Session, issue_id: int) -> int:
+    rounds = db.query(func.max(ResolutionEvidence.resolution_round)).filter(
+        ResolutionEvidence.issue_id == issue_id
+    ).scalar()
+    return int(rounds or 0)
+
+
+def count_affected_students(db: Session, issue_id: int) -> int:
+    """The number of distinct people affected, which is the signal the institution
+    acts on. Counting rows instead would let one impatient student inflate it."""
+    return int(
+        db.query(func.count(func.distinct(Report.reporter_id)))
+        .filter(Report.issue_id == issue_id)
+        .scalar()
+        or 0
+    )
+
+
+def count_reports(db: Session, issue_id: int) -> int:
+    return int(db.query(func.count(Report.id)).filter(Report.issue_id == issue_id).scalar() or 0)
+
 
 def create_timeline_event(
     db: Session,
@@ -31,7 +110,7 @@ def create_timeline_event(
     from_status: Optional[IssueStatus] = None,
     to_status: Optional[IssueStatus] = None,
     details: Optional[str] = None,
-    metadata_dict: Optional[Dict[str, Any]] = None
+    metadata_dict: Optional[Dict[str, Any]] = None,
 ) -> TimelineEvent:
     event = TimelineEvent(
         issue_id=issue_id,
@@ -41,10 +120,27 @@ def create_timeline_event(
         to_status=to_status,
         title=title,
         details=details,
-        metadata_json=json.dumps(metadata_dict) if metadata_dict else None
+        metadata_json=json.dumps(metadata_dict) if metadata_dict else None,
     )
     db.add(event)
     return event
+
+
+def _load_taxonomy(db: Session, issue_type_id: int, location_id: int) -> Tuple[IssueType, Location]:
+    issue_type = db.query(IssueType).filter(
+        IssueType.id == issue_type_id, IssueType.is_active.is_(True)
+    ).first()
+    if not issue_type:
+        raise NotFoundError("That issue type is not available")
+
+    location = db.query(Location).filter(
+        Location.id == location_id, Location.is_active.is_(True)
+    ).first()
+    if not location:
+        raise NotFoundError("That location is not available")
+
+    return issue_type, location
+
 
 def create_issue_and_route_report(
     db: Session,
@@ -53,27 +149,14 @@ def create_issue_and_route_report(
     location_id: int,
     description: str,
     specific_asset: Optional[str] = None,
-    photo_url: Optional[str] = None
-) -> tuple[Issue, Report]:
-    """
-    Submits a new report, deterministically routes it to a handler, and creates an underlying Issue.
-    """
-    issue_type = db.query(IssueType).filter(IssueType.id == issue_type_id, IssueType.is_active.is_(True)).first()
-    if not issue_type:
-        raise HTTPException(status_code=404, detail="Selected IssueType not found or inactive")
+    photo_url: Optional[str] = None,
+) -> Tuple[Issue, Report]:
+    issue_type, location = _load_taxonomy(db, issue_type_id, location_id)
+    routing = resolve_handler(db, issue_type_id, location_id)
 
-    location = db.query(Location).filter(Location.id == location_id, Location.is_active.is_(True)).first()
-    if not location:
-        raise HTTPException(status_code=404, detail="Selected Location not found or inactive")
+    asset_suffix = f" ({specific_asset})" if specific_asset else ""
+    title = f"{issue_type.category} - {issue_type.sub_type}{asset_suffix} at {location.name}"
 
-    # 1. Deterministic routing lookup
-    assigned_handler = resolve_handler_deterministically(db, issue_type_id, location_id)
-    
-    # 2. Build Title
-    asset_str = f" ({specific_asset})" if specific_asset else ""
-    title = f"{issue_type.category} - {issue_type.sub_type}{asset_str} at {location.name}"
-
-    # 3. Create Issue
     issue = Issue(
         issue_type_id=issue_type_id,
         location_id=location_id,
@@ -81,13 +164,14 @@ def create_issue_and_route_report(
         title=title,
         description=description,
         status=IssueStatus.OPEN,
-        current_handler_id=assigned_handler.id if assigned_handler else None,
-        requires_verification=issue_type.requires_verification
+        current_handler_id=routing.handler.id if routing.handler else None,
+        requires_verification=issue_type.requires_verification,
+        needs_triage=routing.handler is None,
+        affected_student_count=1,
     )
     db.add(issue)
-    db.flush() # populate issue.id
+    db.flush()
 
-    # 4. Create Report
     report = Report(
         issue_id=issue.id,
         reporter_id=reporter.id,
@@ -96,50 +180,78 @@ def create_issue_and_route_report(
         specific_asset=specific_asset,
         description=description,
         photo_url=photo_url,
-        status=ReportStatus.LINKED_TO_ISSUE
+        status=ReportStatus.LINKED_TO_ISSUE,
     )
     db.add(report)
     db.flush()
 
-    # 5. Timeline Events
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=reporter.id,
         event_type=TimelineEventType.REPORT_SUBMITTED,
-        from_status=None,
         to_status=IssueStatus.OPEN,
-        title=f"Initial report submitted by {reporter.full_name}",
+        title=f"Reported by {reporter.full_name}",
         details=description,
-        metadata_dict={"report_id": report.id, "reporter_email": reporter.email}
+        metadata_dict={"report_id": report.id},
     )
 
-    handler_name = assigned_handler.full_name if assigned_handler else "Unassigned (Pending)"
-    create_timeline_event(
-        db=db,
-        issue_id=issue.id,
-        actor_id=None,
-        event_type=TimelineEventType.ROUTED,
-        from_status=None,
-        to_status=IssueStatus.OPEN,
-        title=f"Deterministically routed to {handler_name}",
-        details=f"Assigned based on routing rules for {issue_type.category} / {issue_type.sub_type} at {location.name}."
-    )
-
-    # 6. Notifications
-    if assigned_handler:
+    if routing.handler:
+        create_timeline_event(
+            db,
+            issue_id=issue.id,
+            event_type=TimelineEventType.ROUTED,
+            to_status=IssueStatus.OPEN,
+            title=f"Routed to {routing.handler.full_name}",
+            details=(
+                f"Matched routing rule ({routing.match_kind}) for "
+                f"{issue_type.category} / {issue_type.sub_type} at {location.name}."
+            ),
+            metadata_dict={"rule_id": routing.rule.id if routing.rule else None,
+                           "match_kind": routing.match_kind},
+        )
         notify_user(
-            db=db,
-            user_id=assigned_handler.id,
-            title="New Issue Assigned",
-            message=f"New issue '{title}' has been routed to you.",
-            issue_id=issue.id
+            db,
+            user_id=routing.handler.id,
+            title="New issue assigned",
+            message=f"'{title}' has been routed to you.",
+            issue_id=issue.id,
+        )
+    else:
+        create_timeline_event(
+            db,
+            issue_id=issue.id,
+            event_type=TimelineEventType.ROUTED,
+            to_status=IssueStatus.OPEN,
+            title="Awaiting triage",
+            details="No routing rule matched and no catch-all handler is configured. Administrators have been notified.",
+            metadata_dict={"match_kind": routing.match_kind},
+        )
+        admins = find_admins(db)
+        for admin in admins:
+            notify_user(
+                db,
+                user_id=admin.id,
+                title="Issue needs triage",
+                message=f"'{title}' could not be routed automatically. Assign a handler.",
+                issue_id=issue.id,
+            )
+        logger.error(
+            "Issue created without a handler",
+            extra={"issue_id": issue.id, "admins_notified": len(admins)},
         )
 
     db.commit()
     db.refresh(issue)
     db.refresh(report)
+
+    logger.info(
+        "Issue created",
+        extra={"issue_id": issue.id, "report_id": report.id,
+               "handler_id": issue.current_handler_id, "match_kind": routing.match_kind},
+    )
     return issue, report
+
 
 def link_report_to_existing_issue(
     db: Session,
@@ -149,14 +261,31 @@ def link_report_to_existing_issue(
     location_id: int,
     description: str,
     specific_asset: Optional[str] = None,
-    photo_url: Optional[str] = None
-) -> tuple[Issue, Report]:
-    """
-    Links a new student submission to an already active existing issue (after deterministic duplicate prompt).
-    """
-    issue = db.query(Issue).filter(Issue.id == existing_issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Target issue not found")
+    photo_url: Optional[str] = None,
+) -> Tuple[Issue, Report]:
+    """Joining an existing issue is only legitimate when it is genuinely the same
+    problem, so the structured fields must match and the issue must still be open."""
+    _load_taxonomy(db, issue_type_id, location_id)
+    issue = _lock_issue(db, existing_issue_id)
+
+    if issue.status not in ACTIVE_STATUSES:
+        raise InvalidTransitionError(
+            "That issue has already been closed. Submit this as a new report instead."
+        )
+
+    if issue.issue_type_id != issue_type_id or issue.location_id != location_id:
+        raise ValidationError(
+            "This report does not match the issue you are joining. "
+            "Submit it as a separate problem instead."
+        )
+
+    already_reported = (
+        db.query(Report.id)
+        .filter(Report.issue_id == issue.id, Report.reporter_id == reporter.id)
+        .first()
+    )
+    if already_reported:
+        raise ConflictError("You have already reported this issue.")
 
     report = Report(
         issue_id=issue.id,
@@ -166,178 +295,195 @@ def link_report_to_existing_issue(
         specific_asset=specific_asset,
         description=description,
         photo_url=photo_url,
-        status=ReportStatus.LINKED_TO_ISSUE
+        status=ReportStatus.LINKED_TO_ISSUE,
     )
     db.add(report)
     db.flush()
 
-    # Timeline event
+    issue.affected_student_count = count_affected_students(db, issue.id)
+
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=reporter.id,
         event_type=TimelineEventType.REPORT_LINKED,
-        title=f"Additional report linked by {reporter.full_name}",
+        title=f"Also reported by {reporter.full_name}",
         details=description,
-        metadata_dict={"report_id": report.id, "reporter_email": reporter.email}
+        metadata_dict={"report_id": report.id,
+                       "affected_student_count": issue.affected_student_count},
     )
 
-    # Notify handler of increased report count
     if issue.current_handler_id:
         notify_user(
-            db=db,
+            db,
             user_id=issue.current_handler_id,
-            title="Additional Student Report Linked",
-            message=f"{reporter.full_name} reported the same issue '{issue.title}'.",
-            issue_id=issue.id
+            title="Another student reported this issue",
+            message=(
+                f"'{issue.title}' now affects {issue.affected_student_count} students."
+            ),
+            issue_id=issue.id,
         )
 
     db.commit()
     db.refresh(issue)
     db.refresh(report)
+
+    logger.info(
+        "Report linked to existing issue",
+        extra={"issue_id": issue.id, "report_id": report.id,
+               "affected_student_count": issue.affected_student_count},
+    )
     return issue, report
 
-def start_issue_progress(
-    db: Session,
-    issue_id: int,
-    current_user: User
-) -> Issue:
-    """
-    Handler starts working on the assigned issue.
-    """
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
 
-    if current_user.role not in [UserRole.ADMIN, UserRole.HIGHER_AUTHORITY] and issue.current_handler_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the assigned handler or admin can update this issue")
+def start_issue_progress(db: Session, issue_id: int, current_user: User) -> Issue:
+    issue = _lock_issue(db, issue_id)
 
-    if issue.status not in [IssueStatus.OPEN, IssueStatus.REOPENED]:
-        raise HTTPException(status_code=400, detail=f"Cannot start progress on issue with status '{issue.status.value}'")
+    is_assigned = issue.current_handler_id == current_user.id
+    is_privileged = current_user.role in (UserRole.ADMIN, UserRole.HIGHER_AUTHORITY)
+    if not (is_assigned or is_privileged):
+        raise PermissionDeniedError("Only the assigned handler can update this issue")
 
-    prev_status = issue.status
+    _assert_transition(issue, IssueStatus.IN_PROGRESS, "start work on")
+
+    previous_status = issue.status
     issue.status = IssueStatus.IN_PROGRESS
-    
+
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=current_user.id,
         event_type=TimelineEventType.STARTED_PROGRESS,
-        from_status=prev_status,
+        from_status=previous_status,
         to_status=IssueStatus.IN_PROGRESS,
         title=f"Work started by {current_user.full_name}",
-        details="Handler acknowledged the issue and commenced resolution."
     )
 
     notify_affected_students(
-        db=db,
+        db,
         issue_id=issue.id,
-        title="Issue In Progress",
-        message=f"Handler {current_user.full_name} has started working on '{issue.title}'."
+        title="Issue in progress",
+        message=f"Work has started on '{issue.title}'.",
     )
 
     db.commit()
     db.refresh(issue)
+    logger.info("Issue moved to in progress", extra={"issue_id": issue.id, "actor_id": current_user.id})
     return issue
+
 
 def escalate_issue(
     db: Session,
     issue_id: int,
     escalating_user: User,
     reason: str,
-    escalated_to_id: Optional[int] = None
+    escalated_to_id: Optional[int] = None,
 ) -> Escalation:
-    """
-    Handler escalates the issue to a higher authority with a mandatory reason.
-    Preserves full snapshot history.
-    """
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
+    issue = _lock_issue(db, issue_id)
 
-    if escalating_user.role not in [UserRole.ADMIN] and issue.current_handler_id != escalating_user.id:
-        raise HTTPException(status_code=403, detail="Only the assigned handler can escalate this issue")
+    is_assigned = issue.current_handler_id == escalating_user.id
+    if not (is_assigned or escalating_user.role == UserRole.ADMIN):
+        raise PermissionDeniedError("Only the assigned handler can escalate this issue")
 
-    if not reason or not reason.strip():
-        raise HTTPException(status_code=400, detail="Escalation reason is required")
+    _assert_transition(issue, IssueStatus.ESCALATED, "escalate")
 
-    # Find target authority if not specified
-    if not escalated_to_id:
-        authority = (
-            db.query(User)
-            .filter(User.role == UserRole.HIGHER_AUTHORITY, User.is_active.is_(True))
-            .first()
-        )
+    if escalated_to_id is not None:
+        authority = db.query(User).filter(
+            User.id == escalated_to_id,
+            User.is_active.is_(True),
+            User.role.in_([UserRole.HIGHER_AUTHORITY, UserRole.ADMIN]),
+        ).first()
         if not authority:
-            authority = db.query(User).filter(User.role == UserRole.ADMIN, User.is_active.is_(True)).first()
-        target_authority_id = authority.id if authority else None
+            raise NotFoundError("That escalation target is not available")
     else:
-        target_authority_id = escalated_to_id
+        authority = db.query(User).filter(
+            User.role == UserRole.HIGHER_AUTHORITY, User.is_active.is_(True)
+        ).order_by(User.id).first()
+        if not authority:
+            authority = db.query(User).filter(
+                User.role == UserRole.ADMIN, User.is_active.is_(True)
+            ).order_by(User.id).first()
+        if not authority:
+            raise ConflictError(
+                "No higher authority is configured to receive escalations. Contact an administrator."
+            )
 
-    # Build snapshot of history
-    reports_snapshot = [
-        {"id": r.id, "reporter": r.reporter.full_name, "description": r.description, "created_at": str(r.created_at)}
-        for r in issue.reports
-    ]
-    timeline_snapshot = [
-        {"type": t.event_type.value, "title": t.title, "actor": t.actor.full_name if t.actor else "System", "time": str(t.created_at)}
-        for t in issue.timeline_events
-    ]
-    snapshot_data = {
+    snapshot = {
         "issue_id": issue.id,
         "title": issue.title,
-        "location": issue.location.name if issue.location else "",
-        "category": issue.issue_type.category if issue.issue_type else "",
-        "reports": reports_snapshot,
-        "timeline": timeline_snapshot
+        "status_at_escalation": issue.status.value,
+        "location": issue.location.name if issue.location else None,
+        "category": issue.issue_type.category if issue.issue_type else None,
+        "sub_type": issue.issue_type.sub_type if issue.issue_type else None,
+        "specific_asset": issue.specific_asset,
+        "affected_student_count": count_affected_students(db, issue.id),
+        "reports": [
+            {"id": r.id, "reporter": r.reporter.full_name, "description": r.description,
+             "photo_url": r.photo_url, "created_at": r.created_at.isoformat()}
+            for r in issue.reports
+        ],
+        "evidence": [
+            {"id": e.id, "type": e.evidence_type.value, "notes": e.notes,
+             "attachment_url": e.attachment_url, "submitted_by": e.submitted_by.full_name,
+             "created_at": e.created_at.isoformat()}
+            for e in issue.evidences
+        ],
+        "timeline": [
+            {"type": t.event_type.value, "title": t.title, "details": t.details,
+             "actor": t.actor.full_name if t.actor else "System",
+             "created_at": t.created_at.isoformat()}
+            for t in issue.timeline_events
+        ],
     }
 
-    prev_status = issue.status
+    previous_status = issue.status
     issue.status = IssueStatus.ESCALATED
 
     escalation = Escalation(
         issue_id=issue.id,
         escalated_by_id=escalating_user.id,
-        escalated_to_id=target_authority_id,
+        escalated_to_id=authority.id,
         reason=reason,
-        previous_status=prev_status.value,
-        history_snapshot=json.dumps(snapshot_data)
+        previous_status=previous_status.value,
+        history_snapshot=json.dumps(snapshot),
     )
     db.add(escalation)
     db.flush()
 
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=escalating_user.id,
         event_type=TimelineEventType.ESCALATED,
-        from_status=prev_status,
+        from_status=previous_status,
         to_status=IssueStatus.ESCALATED,
         title=f"Escalated by {escalating_user.full_name}",
-        details=f"Reason: {reason}",
-        metadata_dict={"escalation_id": escalation.id, "escalated_to_id": target_authority_id}
+        details=reason,
+        metadata_dict={"escalation_id": escalation.id, "escalated_to_id": authority.id},
     )
 
-    if target_authority_id:
-        notify_user(
-            db=db,
-            user_id=target_authority_id,
-            title="Issue Escalated for Review",
-            message=f"Issue '{issue.title}' was escalated by {escalating_user.full_name}: {reason}",
-            issue_id=issue.id
-        )
-
-    notify_affected_students(
-        db=db,
+    notify_user(
+        db,
+        user_id=authority.id,
+        title="Issue escalated to you",
+        message=f"{escalating_user.full_name} escalated '{issue.title}': {reason}",
         issue_id=issue.id,
-        title="Issue Escalated",
-        message=f"Your reported issue '{issue.title}' has been escalated to campus higher authority for resolution."
+    )
+    notify_affected_students(
+        db,
+        issue_id=issue.id,
+        title="Issue escalated",
+        message=f"'{issue.title}' has been escalated to a higher authority.",
     )
 
     db.commit()
     db.refresh(escalation)
-    db.refresh(issue)
+    logger.info(
+        "Issue escalated",
+        extra={"issue_id": issue.id, "escalated_by": escalating_user.id, "escalated_to": authority.id},
+    )
     return escalation
+
 
 def resolve_issue_with_evidence(
     db: Session,
@@ -345,203 +491,244 @@ def resolve_issue_with_evidence(
     resolving_user: User,
     evidence_type: EvidenceType,
     notes: str,
-    attachment_url: Optional[str] = None
+    attachment_url: Optional[str] = None,
 ) -> ResolutionEvidence:
-    """
-    Handler or authority marks issue resolved and attaches required evidence.
-    If issue_type.requires_verification is True, status becomes RESOLVED_PENDING_VERIFICATION.
-    Otherwise becomes VERIFIED_CLOSED.
-    """
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
+    issue = _lock_issue(db, issue_id)
 
-    is_handler = issue.current_handler_id == resolving_user.id
-    is_privileged = resolving_user.role in [UserRole.ADMIN, UserRole.HIGHER_AUTHORITY]
-    if not (is_handler or is_privileged):
-        raise HTTPException(status_code=403, detail="Only assigned handler, higher authority, or admin can resolve this issue")
+    is_assigned = issue.current_handler_id == resolving_user.id
+    is_privileged = resolving_user.role in (UserRole.ADMIN, UserRole.HIGHER_AUTHORITY)
+    if not (is_assigned or is_privileged):
+        raise PermissionDeniedError("Only the assigned handler can resolve this issue")
 
-    if not notes or not notes.strip():
-        raise HTTPException(status_code=400, detail="Resolution notes/action description is mandatory")
-
-    prev_status = issue.status
-    next_status = (
+    target_status = (
         IssueStatus.RESOLVED_PENDING_VERIFICATION
         if issue.requires_verification
         else IssueStatus.VERIFIED_CLOSED
     )
-    issue.status = next_status
+    _assert_transition(issue, target_status, "resolve")
+
+    previous_status = issue.status
+    issue.status = target_status
+    resolution_round = _current_resolution_round(db, issue.id) + 1
 
     evidence = ResolutionEvidence(
         issue_id=issue.id,
         submitted_by_id=resolving_user.id,
         evidence_type=evidence_type,
         notes=notes,
-        attachment_url=attachment_url
+        attachment_url=attachment_url,
+        resolution_round=resolution_round,
     )
     db.add(evidence)
     db.flush()
 
-    status_str = "resolved (pending student verification)" if issue.requires_verification else "resolved and closed"
+    awaiting = target_status == IssueStatus.RESOLVED_PENDING_VERIFICATION
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=resolving_user.id,
         event_type=TimelineEventType.RESOLVED,
-        from_status=prev_status,
-        to_status=next_status,
-        title=f"Marked {status_str} by {resolving_user.full_name}",
-        details=f"Evidence ({evidence_type.value}): {notes}",
-        metadata_dict={"evidence_id": evidence.id, "attachment_url": attachment_url}
+        from_status=previous_status,
+        to_status=target_status,
+        title=(
+            f"Resolved by {resolving_user.full_name}"
+            + (" - awaiting student verification" if awaiting else " and closed")
+        ),
+        details=notes,
+        metadata_dict={"evidence_id": evidence.id, "evidence_type": evidence_type.value,
+                       "resolution_round": resolution_round},
     )
 
-    # Notify affected students
-    if issue.requires_verification:
-        notif_msg = f"Handler {resolving_user.full_name} has resolved '{issue.title}'. Please verify if the issue is fixed."
-    else:
-        notif_msg = f"Issue '{issue.title}' has been successfully resolved and closed."
-
     notify_affected_students(
-        db=db,
+        db,
         issue_id=issue.id,
-        title="Issue Resolution Update",
-        message=notif_msg
+        title="Issue resolved" if not awaiting else "Please confirm this is fixed",
+        message=(
+            f"'{issue.title}' has been marked resolved. Confirm it is actually fixed, "
+            "or tell us it is not."
+            if awaiting
+            else f"'{issue.title}' has been resolved and closed."
+        ),
     )
 
     db.commit()
     db.refresh(evidence)
-    db.refresh(issue)
+    logger.info(
+        "Issue resolved",
+        extra={"issue_id": issue.id, "actor_id": resolving_user.id,
+               "resolution_round": resolution_round, "awaiting_verification": awaiting},
+    )
     return evidence
+
 
 def verify_issue_resolution(
     db: Session,
     issue_id: int,
     verifying_user: User,
-    status: VerificationStatus,
-    comment: Optional[str] = None
+    verification_status: VerificationStatus,
+    comment: Optional[str] = None,
 ) -> Verification:
-    """
-    Affected student confirms or disputes the resolution.
-    If confirmed -> VERIFIED_CLOSED
-    If disputed -> REOPENED
-    """
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
+    """The first affected student to respond settles it: confirming closes the issue,
+    disputing reopens it. That is a deliberate product choice, recorded here so the
+    behaviour is obvious to the next reader."""
+    issue = _lock_issue(db, issue_id)
 
     if issue.status != IssueStatus.RESOLVED_PENDING_VERIFICATION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Issue is not pending verification (current status: {issue.status.value})"
+        raise InvalidTransitionError(
+            f"This issue is not awaiting verification (it is {issue.status.value.replace('_', ' ').lower()})."
         )
 
-    # Verify that the user is an affected student (or admin)
-    is_reporter = any(r.reporter_id == verifying_user.id for r in issue.reports)
-    if not is_reporter and verifying_user.role not in [UserRole.ADMIN]:
-        raise HTTPException(status_code=403, detail="Only affected students who reported this issue can verify its resolution")
+    is_reporter = (
+        db.query(Report.id)
+        .filter(Report.issue_id == issue.id, Report.reporter_id == verifying_user.id)
+        .first()
+        is not None
+    )
+    if not is_reporter and verifying_user.role != UserRole.ADMIN:
+        raise PermissionDeniedError(
+            "Only students affected by this issue can verify its resolution"
+        )
+
+    resolution_round = _current_resolution_round(db, issue.id)
+    duplicate = (
+        db.query(Verification.id)
+        .filter(
+            Verification.issue_id == issue.id,
+            Verification.verified_by_id == verifying_user.id,
+            Verification.resolution_round == resolution_round,
+        )
+        .first()
+    )
+    if duplicate:
+        raise ConflictError("You have already responded to this resolution.")
+
+    confirmed = verification_status == VerificationStatus.CONFIRMED
+    target_status = IssueStatus.VERIFIED_CLOSED if confirmed else IssueStatus.REOPENED
+    _assert_transition(issue, target_status, "verify")
 
     verification = Verification(
         issue_id=issue.id,
         verified_by_id=verifying_user.id,
-        status=status,
-        comment=comment
+        status=verification_status,
+        comment=comment,
+        resolution_round=resolution_round,
     )
     db.add(verification)
     db.flush()
 
-    prev_status = issue.status
-    if status == VerificationStatus.CONFIRMED:
-        issue.status = IssueStatus.VERIFIED_CLOSED
-        create_timeline_event(
-            db=db,
+    previous_status = issue.status
+    issue.status = target_status
+
+    create_timeline_event(
+        db,
+        issue_id=issue.id,
+        actor_id=verifying_user.id,
+        event_type=TimelineEventType.VERIFIED if confirmed else TimelineEventType.DISPUTED,
+        from_status=previous_status,
+        to_status=target_status,
+        title=(
+            f"Confirmed fixed by {verifying_user.full_name}"
+            if confirmed
+            else f"Reopened by {verifying_user.full_name} - still not fixed"
+        ),
+        details=comment,
+        metadata_dict={"resolution_round": resolution_round},
+    )
+
+    if issue.current_handler_id:
+        notify_user(
+            db,
+            user_id=issue.current_handler_id,
+            title="Resolution confirmed" if confirmed else "Issue reopened",
+            message=(
+                f"{verifying_user.full_name} confirmed '{issue.title}' is fixed."
+                if confirmed
+                else f"{verifying_user.full_name} says '{issue.title}' is still not fixed."
+                + (f" Comment: {comment}" if comment else "")
+            ),
             issue_id=issue.id,
-            actor_id=verifying_user.id,
-            event_type=TimelineEventType.VERIFIED,
-            from_status=prev_status,
-            to_status=IssueStatus.VERIFIED_CLOSED,
-            title=f"Resolution confirmed by {verifying_user.full_name}",
-            details=comment or "Student confirmed that the problem has been satisfactorily fixed."
         )
-        if issue.current_handler_id:
-            notify_user(
-                db=db,
-                user_id=issue.current_handler_id,
-                title="Resolution Verified & Closed",
-                message=f"Student {verifying_user.full_name} confirmed the resolution for '{issue.title}'.",
-                issue_id=issue.id
-            )
-    else: # DISPUTED
-        issue.status = IssueStatus.REOPENED
-        create_timeline_event(
-            db=db,
-            issue_id=issue.id,
-            actor_id=verifying_user.id,
-            event_type=TimelineEventType.DISPUTED,
-            from_status=prev_status,
-            to_status=IssueStatus.REOPENED,
-            title=f"Resolution disputed / reopened by {verifying_user.full_name}",
-            details=comment or "Student indicated the problem is still unresolved."
-        )
-        if issue.current_handler_id:
-            notify_user(
-                db=db,
-                user_id=issue.current_handler_id,
-                title="Issue Reopened (Verification Disputed)",
-                message=f"Student {verifying_user.full_name} reported that '{issue.title}' is still broken: {comment or 'No comment'}",
-                issue_id=issue.id
-            )
+
+    notify_affected_students(
+        db,
+        issue_id=issue.id,
+        title="Issue closed" if confirmed else "Issue reopened",
+        message=(
+            f"'{issue.title}' was confirmed fixed and is now closed."
+            if confirmed
+            else f"'{issue.title}' was reported as still broken and has been reopened."
+        ),
+        exclude_user_id=verifying_user.id,
+    )
 
     db.commit()
     db.refresh(verification)
-    db.refresh(issue)
+    logger.info(
+        "Resolution verification recorded",
+        extra={"issue_id": issue.id, "actor_id": verifying_user.id,
+               "verification_status": verification_status.value},
+    )
     return verification
+
 
 def reassign_issue_handler(
     db: Session,
     issue_id: int,
     new_handler_id: int,
     reassigned_by: User,
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
 ) -> Issue:
-    """
-    Higher authority or admin reassigns an issue to a new handler.
-    """
-    if reassigned_by.role not in [UserRole.ADMIN, UserRole.HIGHER_AUTHORITY]:
-        raise HTTPException(status_code=403, detail="Only admin or higher authority can reassign issues")
+    if reassigned_by.role not in (UserRole.ADMIN, UserRole.HIGHER_AUTHORITY):
+        raise PermissionDeniedError("Only an admin or higher authority can reassign issues")
 
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise HTTPException(status_code=404, detail="Issue not found")
+    issue = _lock_issue(db, issue_id)
 
-    new_handler = db.query(User).filter(User.id == new_handler_id, User.is_active.is_(True)).first()
+    if issue.status == IssueStatus.VERIFIED_CLOSED:
+        raise InvalidTransitionError("A closed issue cannot be reassigned")
+
+    new_handler = db.query(User).filter(
+        User.id == new_handler_id,
+        User.is_active.is_(True),
+        User.role.in_([UserRole.HANDLER, UserRole.HIGHER_AUTHORITY, UserRole.ADMIN]),
+    ).first()
     if not new_handler:
-        raise HTTPException(status_code=404, detail="Target handler not found")
+        raise NotFoundError("That handler is not available")
 
-    old_handler_name = issue.current_handler.full_name if issue.current_handler else "None"
+    if issue.current_handler_id == new_handler.id:
+        raise ConflictError("That handler is already assigned to this issue")
+
+    previous_handler_name = issue.current_handler.full_name if issue.current_handler else "nobody"
+    previous_status = issue.status
+
     issue.current_handler_id = new_handler.id
-    
-    # If issue was escalated, reassigning resets it to IN_PROGRESS or OPEN
+    issue.needs_triage = False
     if issue.status == IssueStatus.ESCALATED:
         issue.status = IssueStatus.IN_PROGRESS
 
     create_timeline_event(
-        db=db,
+        db,
         issue_id=issue.id,
         actor_id=reassigned_by.id,
         event_type=TimelineEventType.REASSIGNED,
+        from_status=previous_status,
+        to_status=issue.status,
         title=f"Reassigned to {new_handler.full_name} by {reassigned_by.full_name}",
-        details=f"Transferred from {old_handler_name}. Reason: {reason or 'Administrative reassignment'}"
+        details=f"Previously assigned to {previous_handler_name}."
+        + (f" Reason: {reason}" if reason else ""),
     )
 
     notify_user(
-        db=db,
+        db,
         user_id=new_handler.id,
-        title="Issue Reassigned to You",
-        message=f"Issue '{issue.title}' has been assigned to you by {reassigned_by.full_name}.",
-        issue_id=issue.id
+        title="Issue assigned to you",
+        message=f"'{issue.title}' was assigned to you by {reassigned_by.full_name}.",
+        issue_id=issue.id,
     )
 
     db.commit()
     db.refresh(issue)
+    logger.info(
+        "Issue reassigned",
+        extra={"issue_id": issue.id, "new_handler_id": new_handler.id, "actor_id": reassigned_by.id},
+    )
     return issue
-

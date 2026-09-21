@@ -1,55 +1,63 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+import logging
+
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.orm import Session, joinedload
+
+from app.api.deps import get_current_user, parse_pagination
+from app.config import settings
 from app.database import get_db
-from app.models.user import User
 from app.models.report import Report
+from app.models.user import User
+from app.rate_limit import rate_limit
+from app.schemas.issue import Page
 from app.schemas.report import (
+    DuplicateCheckRequest,
+    DuplicateCheckResponse,
     ReportCreate,
     ReportOut,
-    DuplicateCheckRequest,
-    DuplicateCheckResponse
 )
-from app.schemas.issue import IssueDetailOut
 from app.services.duplicate_check import check_duplicate_issues
 from app.services.issue_state_machine import (
     create_issue_and_route_report,
-    link_report_to_existing_issue
+    link_report_to_existing_issue,
 )
-from app.api.deps import get_current_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+submit_rate_limit = rate_limit("submit_report", settings.WRITE_RATE_LIMIT_PER_MINUTE, 60)
+
 
 @router.post("/check-duplicate", response_model=DuplicateCheckResponse)
 def check_duplicate(
-    req: DuplicateCheckRequest,
+    payload: DuplicateCheckRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Deterministically checks if an active issue exists with identical structured parameters
-    (issue_type_id + location_id + optional asset), and returns it as a suggestion.
-    """
+    """Structured lookup on (issue type, location, asset). Returns suggestions only:
+    the student chooses whether their report joins an existing issue."""
     return check_duplicate_issues(
         db=db,
-        issue_type_id=req.issue_type_id,
-        location_id=req.location_id,
-        specific_asset=req.specific_asset
+        issue_type_id=payload.issue_type_id,
+        location_id=payload.location_id,
+        specific_asset=payload.specific_asset,
+        viewer_id=current_user.id,
     )
 
-@router.post("", response_model=ReportOut, status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "",
+    response_model=ReportOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(submit_rate_limit)],
+)
 def submit_report(
     report_in: ReportCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Submits a report.
-    - If existing_issue_id is passed, links the report to the existing issue.
-    - Otherwise, deterministically routes to a handler and creates a new issue.
-    """
-    if report_in.existing_issue_id:
-        issue, report = link_report_to_existing_issue(
+    if report_in.existing_issue_id is not None:
+        _, report = link_report_to_existing_issue(
             db=db,
             reporter=current_user,
             existing_issue_id=report_in.existing_issue_id,
@@ -57,34 +65,46 @@ def submit_report(
             location_id=report_in.location_id,
             description=report_in.description,
             specific_asset=report_in.specific_asset,
-            photo_url=report_in.photo_url
+            photo_url=report_in.photo_url,
         )
     else:
-        issue, report = create_issue_and_route_report(
+        _, report = create_issue_and_route_report(
             db=db,
             reporter=current_user,
             issue_type_id=report_in.issue_type_id,
             location_id=report_in.location_id,
             description=report_in.description,
             specific_asset=report_in.specific_asset,
-            photo_url=report_in.photo_url
+            photo_url=report_in.photo_url,
         )
-    
     return report
 
-@router.get("/my", response_model=List[ReportOut])
+
+@router.get("/my", response_model=Page[ReportOut])
 def get_my_reports(
+    limit: int = Query(default=None),
+    offset: int = Query(default=None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Returns all reports submitted by the logged-in student.
-    """
+    resolved_limit, resolved_offset = parse_pagination(limit, offset)
+
+    base = db.query(Report).filter(Report.reporter_id == current_user.id)
+    total = base.count()
     reports = (
-        db.query(Report)
-        .filter(Report.reporter_id == current_user.id)
-        .order_by(Report.created_at.desc())
+        base.options(
+            joinedload(Report.issue_type),
+            joinedload(Report.location),
+        )
+        .order_by(Report.created_at.desc(), Report.id.desc())
+        .limit(resolved_limit)
+        .offset(resolved_offset)
         .all()
     )
-    return reports
 
+    return Page[ReportOut](
+        items=[ReportOut.model_validate(report) for report in reports],
+        total=total,
+        limit=resolved_limit,
+        offset=resolved_offset,
+    )

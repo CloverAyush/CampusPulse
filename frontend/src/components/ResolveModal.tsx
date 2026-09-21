@@ -1,172 +1,158 @@
 "use client";
 
 import React, { useState } from "react";
-import { EvidenceType } from "@/lib/types";
-import { CheckCircle2, FileCheck, X, Link as LinkIcon, Camera, FileText } from "lucide-react";
+
+import { InlineError } from "@/components/States";
+import { Modal } from "@/components/Modal";
+import { errorMessage } from "@/lib/api";
+import { EvidenceType, Issue } from "@/lib/types";
+
+const EVIDENCE_OPTIONS: { value: EvidenceType; label: string; hint: string }[] = [
+  { value: "photo", label: "Photo", hint: "A link to a photo of the completed work" },
+  { value: "description", label: "Action description", hint: "What you did, in your own words" },
+  { value: "maintenance_record", label: "Maintenance record", hint: "Job card, work order or invoice" },
+  { value: "screenshot", label: "Screenshot", hint: "For network or system fixes" },
+  { value: "other", label: "Other", hint: "Anything else that proves the work" },
+];
+
+const MIN_NOTES = 10;
 
 interface ResolveModalProps {
-  isOpen: boolean;
-  issueTitle: string;
-  requiresVerification: boolean;
+  open: boolean;
+  issue: Issue | null;
   onClose: () => void;
   onSubmit: (data: { evidence_type: EvidenceType; notes: string; attachment_url?: string }) => Promise<void>;
 }
 
-export const ResolveModal: React.FC<ResolveModalProps> = ({
-  isOpen,
-  issueTitle,
-  requiresVerification,
-  onClose,
-  onSubmit,
-}) => {
-  const [evidenceType, setEvidenceType] = useState<EvidenceType>("photo");
+export const ResolveModal: React.FC<ResolveModalProps> = ({ open, issue, onClose, onSubmit }) => {
+  const [evidenceType, setEvidenceType] = useState<EvidenceType>("description");
   const [notes, setNotes] = useState("");
   const [attachmentUrl, setAttachmentUrl] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!isOpen) return null;
+  if (!issue) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!notes.trim()) {
-      setError("Please describe the actions taken to resolve the issue.");
+  const notesTooShort = notes.trim().length < MIN_NOTES;
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (notesTooShort) {
+      setError(`Describe what you did in at least ${MIN_NOTES} characters.`);
       return;
     }
+
+    setSubmitting(true);
     setError(null);
-    setLoading(true);
     try {
       await onSubmit({
         evidence_type: evidenceType,
         notes: notes.trim(),
         attachment_url: attachmentUrl.trim() || undefined,
       });
-      onClose();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to resolve issue");
+      setNotes("");
+      setAttachmentUrl("");
+      setEvidenceType("description");
+    } catch (cause) {
+      setError(errorMessage(cause));
     } finally {
-      setLoading(false);
+      setSubmitting(false);
     }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full overflow-hidden border border-gray-100 flex flex-col">
-        {/* Header */}
-        <div className="bg-teal-50 px-6 py-5 border-b border-teal-100 flex items-start justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-teal-600 text-white rounded-2xl shadow-md shadow-teal-600/20">
-              <CheckCircle2 className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-base font-bold text-gray-900">Resolve Issue with Evidence</h3>
-              <p className="text-xs text-teal-800 line-clamp-1">{issueTitle}</p>
-            </div>
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Mark as resolved"
+      description={
+        issue.requires_verification
+          ? "The students who reported this will be asked to confirm it is actually fixed."
+          : "This issue type closes immediately once you record the work."
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <p className="rounded-xl bg-gray-50 px-3 py-2 text-xs text-gray-600">{issue.title}</p>
+
+        <fieldset>
+          <legend className="mb-1.5 text-xs font-bold uppercase tracking-wider text-gray-500">
+            Evidence type
+          </legend>
+          <div className="grid gap-1.5 sm:grid-cols-2">
+            {EVIDENCE_OPTIONS.map((option) => (
+              <label
+                key={option.value}
+                className={`cursor-pointer rounded-xl border px-3 py-2 text-xs transition ${
+                  evidenceType === option.value
+                    ? "border-indigo-400 bg-indigo-50 text-indigo-900"
+                    : "border-gray-200 hover:border-gray-300"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="evidence_type"
+                  value={option.value}
+                  checked={evidenceType === option.value}
+                  onChange={() => setEvidenceType(option.value)}
+                  className="sr-only"
+                />
+                <span className="block font-semibold">{option.label}</span>
+                <span className="mt-0.5 block text-[11px] text-gray-500">{option.hint}</span>
+              </label>
+            ))}
           </div>
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100"
-          >
-            <X className="w-5 h-5" />
-          </button>
+        </fieldset>
+
+        <div>
+          <label htmlFor="resolve-notes" className="mb-1 block text-xs font-bold uppercase tracking-wider text-gray-500">
+            What did you do?
+          </label>
+          <textarea
+            id="resolve-notes"
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            rows={4}
+            maxLength={2000}
+            required
+            placeholder="Replaced the fan regulator and tested it on all three speeds."
+            className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+          />
+          <p className="mt-1 text-[11px] text-gray-400">
+            {notes.trim().length}/2000 characters. Minimum {MIN_NOTES}.
+          </p>
         </div>
 
-        {/* Form Body */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          {error && (
-            <div className="p-3 text-xs bg-rose-50 text-rose-700 border border-rose-200 rounded-xl font-medium">
-              {error}
-            </div>
-          )}
+        <div>
+          <label htmlFor="resolve-url" className="mb-1 block text-xs font-bold uppercase tracking-wider text-gray-500">
+            Evidence link <span className="font-medium normal-case text-gray-400">(optional)</span>
+          </label>
+          <input
+            id="resolve-url"
+            type="url"
+            inputMode="url"
+            value={attachmentUrl}
+            onChange={(event) => setAttachmentUrl(event.target.value)}
+            placeholder="https://drive.example.edu/work-order-4821.jpg"
+            className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+          />
+          <p className="mt-1 text-[11px] text-gray-400">Must be an https link.</p>
+        </div>
 
-          <div className="bg-teal-50/50 p-3 rounded-xl border border-teal-100 text-xs text-teal-900 leading-relaxed">
-            <span className="font-bold">Verification Policy: </span>
-            {requiresVerification
-              ? "This issue requires Student Verification. Affected student(s) will be notified to confirm or dispute your resolution."
-              : "Direct Closure: This issue type does not require student verification and will close immediately upon resolution."}
-          </div>
+        <InlineError message={error} />
 
-          {/* Evidence Type */}
-          <div>
-            <label className="block text-xs font-semibold text-gray-700 mb-1.5">
-              Evidence / Proof Type
-            </label>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { type: "photo", label: "Fixed Photo", icon: <Camera className="w-3.5 h-3.5" /> },
-                { type: "maintenance_record", label: "Work Record / Slip", icon: <FileCheck className="w-3.5 h-3.5" /> },
-                { type: "description", label: "Action Notes", icon: <FileText className="w-3.5 h-3.5" /> },
-                { type: "screenshot", label: "System Screenshot", icon: <FileText className="w-3.5 h-3.5" /> },
-              ].map((item) => (
-                <button
-                  key={item.type}
-                  type="button"
-                  onClick={() => setEvidenceType(item.type as EvidenceType)}
-                  className={`flex items-center gap-2 p-2.5 rounded-xl border text-xs font-medium transition-all ${
-                    evidenceType === item.type
-                      ? "border-teal-600 bg-teal-50 text-teal-900 font-semibold"
-                      : "border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
-                  }`}
-                >
-                  {item.icon}
-                  <span>{item.label}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Resolution Description */}
-          <div>
-            <label className="block text-xs font-semibold text-gray-700 mb-1">
-              Actions Taken & Resolution Details <span className="text-rose-500">*</span>
-            </label>
-            <textarea
-              required
-              rows={3}
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="E.g., Replaced capacitor in fan #2 and verified quiet operation at all regulator speeds."
-              className="w-full text-xs p-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none"
-            />
-          </div>
-
-          {/* Attachment URL */}
-          <div>
-            <label className="block text-xs font-semibold text-gray-700 mb-1">
-              Attachment / Evidence URL <span className="text-gray-400 font-normal">(optional photo/file link)</span>
-            </label>
-            <div className="relative">
-              <LinkIcon className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" />
-              <input
-                type="url"
-                value={attachmentUrl}
-                onChange={(e) => setAttachmentUrl(e.target.value)}
-                placeholder="https://example.com/repair_photo.jpg"
-                className="w-full text-xs pl-9 pr-3 py-2 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none"
-              />
-            </div>
-          </div>
-
-          {/* Footer Actions */}
-          <div className="pt-3 flex items-center justify-end gap-2 border-t border-gray-100">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-gray-600 hover:bg-gray-100 rounded-xl transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-5 py-2.5 text-xs font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-xl shadow-md shadow-teal-600/20 transition-all disabled:opacity-50"
-            >
-              {loading ? "Submitting..." : "Submit Resolution & Evidence"}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <button type="button" onClick={onClose} className="rounded-full px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-100">
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={submitting || notesTooShort}
+            className="rounded-full bg-teal-600 px-5 py-2 text-sm font-semibold text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {submitting ? "Saving…" : "Mark resolved"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 };
-

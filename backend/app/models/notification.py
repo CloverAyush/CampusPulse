@@ -1,7 +1,9 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
-from datetime import datetime
+
 from app.database import Base
+from app.models.base import TimestampColumn, utcnow
+
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -12,9 +14,7 @@ class Notification(Base):
     title = Column(String(255), nullable=False)
     message = Column(Text, nullable=False)
     is_read = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(TimestampColumn, default=utcnow, nullable=False)
 
-    # Relationships
     user = relationship("User", back_populates="notifications")
     issue = relationship("Issue", back_populates="notifications")
-

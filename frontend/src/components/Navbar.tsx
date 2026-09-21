@@ -1,266 +1,264 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useAuth } from "@/lib/auth";
-import { api } from "@/lib/api";
-import { Notification } from "@/lib/types";
 import {
-  Building2,
-  PlusCircle,
-  FileText,
-  Wrench,
-  ShieldAlert,
-  Settings,
   Bell,
-  CheckCheck,
+  Building2,
+  FileText,
+  LayoutGrid,
   LogOut,
   Menu,
+  PlusCircle,
+  Settings,
+  Wrench,
   X,
 } from "lucide-react";
+
+import { api } from "@/lib/api";
+import { ROLE_LABELS, useAuth } from "@/lib/auth";
+import { formatRelative } from "@/lib/format";
+import { Notification, UserRole } from "@/lib/types";
+
+const POLL_INTERVAL_MS = 30000;
+const MAX_BACKOFF_MS = 300000;
+
+interface NavLink {
+  href: string;
+  label: string;
+  icon: React.ReactNode;
+  roles: UserRole[];
+  primary?: boolean;
+}
+
+const NAV_LINKS: NavLink[] = [
+  { href: "/report", label: "Report an issue", icon: <PlusCircle className="h-4 w-4" aria-hidden />, roles: ["student", "admin"], primary: true },
+  { href: "/my-reports", label: "Issues", icon: <FileText className="h-4 w-4" aria-hidden />, roles: ["student", "admin"] },
+  { href: "/handler", label: "My queue", icon: <Wrench className="h-4 w-4" aria-hidden />, roles: ["handler"] },
+  { href: "/higher-authority", label: "Escalations", icon: <Building2 className="h-4 w-4" aria-hidden />, roles: ["higher_authority", "admin"] },
+  { href: "/admin", label: "Configuration", icon: <Settings className="h-4 w-4" aria-hidden />, roles: ["admin"] },
+];
 
 export const Navbar: React.FC = () => {
   const pathname = usePathname();
   const { user, logout } = useAuth();
-  const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [showNotifs, setShowNotifs] = useState(false);
+  const [inbox, setInbox] = useState<{ ownerId: number; items: Notification[] }>({
+    ownerId: -1,
+    items: [],
+  });
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const backoffRef = useRef(POLL_INTERVAL_MS);
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
-  const fetchNotifs = async () => {
-    if (user) {
-      try {
-        const notifs = await api.getNotifications();
-        setNotifications(notifs);
-      } catch {
-        // ignore notification fetch failure in background
-      }
-    }
-  };
+  const closeMenus = useCallback(() => {
+    setMobileMenuOpen(false);
+    setNotificationsOpen(false);
+  }, []);
+
+  const userId = user?.id ?? null;
 
   useEffect(() => {
-    fetchNotifs();
-    const interval = setInterval(fetchNotifs, 10000);
-    return () => clearInterval(interval);
-  }, [user]);
+    if (userId === null) return;
 
-  const unreadCount = notifications.filter((n) => !n.is_read).length;
+    let timer: ReturnType<typeof setTimeout>;
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const page = await api.getNotifications();
+        if (cancelled) return;
+        setInbox({ ownerId: userId, items: page.items });
+        backoffRef.current = POLL_INTERVAL_MS;
+      } catch {
+        // Background polling must not interrupt the page. Back off instead, so an
+        // outage does not turn every open tab into a request storm.
+        backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF_MS);
+      }
+    };
+
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        if (document.visibilityState === "visible") await poll();
+        schedule();
+      }, backoffRef.current);
+    };
+
+    void poll();
+    schedule();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [userId]);
+
+  useEffect(() => {
+    if (!notificationsOpen) return;
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(event.target as Node)) {
+        setNotificationsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [notificationsOpen]);
+
+  if (!user) return null;
+
+  // A stale inbox from a previously signed-in account must never render, so the
+  // list is only shown when it was fetched for the user who is signed in now.
+  const notifications = inbox.ownerId === user.id ? inbox.items : [];
+  const unreadCount = notifications.filter((item) => !item.is_read).length;
+  const visibleLinks = NAV_LINKS.filter((link) => link.roles.includes(user.role));
 
   const handleMarkAllRead = async () => {
+    const previous = inbox;
+    setInbox((state) => ({
+      ...state,
+      items: state.items.map((item) => ({ ...item, is_read: true })),
+    }));
     try {
       await api.markAllNotificationsRead();
-      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
     } catch {
-      // ignore
+      setInbox(previous);
     }
   };
 
-  const navLinks = [
-    {
-      href: "/report",
-      label: "Report Issue",
-      icon: <PlusCircle className="w-4 h-4" />,
-      roles: ["student", "admin"],
-      primary: true,
-    },
-    {
-      href: "/my-reports",
-      label: "My Reports & Issues",
-      icon: <FileText className="w-4 h-4" />,
-      roles: ["student", "admin"],
-    },
-    {
-      href: "/handler",
-      label: "Handler Queue",
-      icon: <Wrench className="w-4 h-4" />,
-      roles: ["handler", "admin"],
-    },
-    {
-      href: "/higher-authority",
-      label: "Escalated Cases",
-      icon: <ShieldAlert className="w-4 h-4" />,
-      roles: ["higher_authority", "admin"],
-    },
-    {
-      href: "/admin",
-      label: "Admin Config",
-      icon: <Settings className="w-4 h-4" />,
-      roles: ["admin"],
-    },
-  ];
-
-  const visibleLinks = navLinks.filter(
-    (link) => !user || link.roles.includes(user.role)
-  );
-
   return (
-    <nav className="bg-white border-b border-gray-200 sticky top-0 z-40">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex justify-between h-16">
-          {/* Logo & Brand */}
-          <div className="flex items-center gap-6">
-            <Link href="/" className="flex items-center gap-2.5 group">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-700 flex items-center justify-center text-white shadow-md shadow-indigo-500/20 group-hover:scale-105 transition-transform">
-                <Building2 className="w-5 h-5" />
-              </div>
-              <div>
-                <span className="text-lg font-bold bg-gradient-to-r from-gray-900 to-gray-700 bg-clip-text text-transparent">
-                  Campus<span className="text-indigo-600">Pulse</span>
-                </span>
-                <span className="block text-[10px] uppercase tracking-wider font-semibold text-gray-500">
-                  Resolution Platform
-                </span>
-              </div>
-            </Link>
+    <header className="sticky top-0 z-40 border-b border-gray-200 bg-white/90 backdrop-blur">
+      <nav className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:px-8" aria-label="Main">
+        <Link href="/" className="flex shrink-0 items-center gap-2 font-bold tracking-tight text-gray-900">
+          <span className="grid h-7 w-7 place-items-center rounded-lg bg-indigo-600 text-white">
+            <LayoutGrid className="h-4 w-4" aria-hidden />
+          </span>
+          CampusPulse
+        </Link>
 
-            {/* Desktop Navigation Links */}
-            <div className="hidden md:flex items-center space-x-1 pl-4 border-l border-gray-200">
-              {visibleLinks.map((link) => {
-                const isActive = pathname === link.href;
-                return (
-                  <Link
-                    key={link.href}
-                    href={link.href}
-                    className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium transition-all ${
-                      link.primary
-                        ? "bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm shadow-indigo-500/20"
-                        : isActive
-                        ? "bg-indigo-50 text-indigo-700 font-semibold"
-                        : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"
-                    }`}
-                  >
-                    {link.icon}
-                    <span>{link.label}</span>
-                  </Link>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Right Action Items */}
-          <div className="flex items-center gap-3">
-            {/* Notification Bell */}
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowNotifs(!showNotifs)}
-                className="relative p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg focus:outline-none transition-colors"
-                aria-label="Notifications"
+        <div className="ml-2 hidden flex-1 items-center gap-1 md:flex">
+          {visibleLinks.map((link) => {
+            const isActive = pathname === link.href;
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                onClick={closeMenus}
+                aria-current={isActive ? "page" : undefined}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium transition ${
+                  isActive
+                    ? "bg-indigo-50 text-indigo-700"
+                    : link.primary
+                      ? "bg-indigo-600 text-white hover:bg-indigo-700"
+                      : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+                }`}
               >
-                <Bell className="w-5 h-5" />
-                {unreadCount > 0 && (
-                  <span className="absolute top-1.5 right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-rose-500 text-[10px] font-bold text-white ring-2 ring-white">
-                    {unreadCount}
-                  </span>
-                )}
-              </button>
+                {link.icon}
+                {link.label}
+              </Link>
+            );
+          })}
+        </div>
 
-              {showNotifs && (
-                <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-gray-100 py-3 z-50 animate-in fade-in slide-in-from-top-2 duration-150">
-                  <div className="flex items-center justify-between px-4 pb-2 border-b border-gray-100">
-                    <div className="font-semibold text-sm text-gray-900 flex items-center gap-2">
-                      <span>In-App Notifications</span>
-                      {unreadCount > 0 && (
-                        <span className="text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded-full font-bold">
-                          {unreadCount} new
-                        </span>
-                      )}
-                    </div>
-                    {unreadCount > 0 && (
-                      <button
-                        onClick={handleMarkAllRead}
-                        className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center gap-1 font-medium"
-                      >
-                        <CheckCheck className="w-3.5 h-3.5" />
-                        Mark all read
-                      </button>
-                    )}
-                  </div>
+        <div className="ml-auto flex items-center gap-1.5">
+          <div className="relative" ref={panelRef}>
+            <button
+              type="button"
+              onClick={() => setNotificationsOpen((open) => !open)}
+              aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
+              aria-expanded={notificationsOpen}
+              className="relative grid h-9 w-9 place-items-center rounded-full text-gray-600 hover:bg-gray-100"
+            >
+              <Bell className="h-4.5 w-4.5" aria-hidden />
+              {unreadCount > 0 ? (
+                <span className="absolute right-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              ) : null}
+            </button>
 
-                  <div className="max-h-80 overflow-y-auto divide-y divide-gray-50">
-                    {notifications.length === 0 ? (
-                      <div className="py-8 text-center text-xs text-gray-400">
-                        No notifications yet.
-                      </div>
-                    ) : (
-                      notifications.slice(0, 15).map((n) => (
-                        <div
-                          key={n.id}
-                          className={`p-3.5 text-xs transition-colors hover:bg-gray-50 ${
-                            !n.is_read ? "bg-indigo-50/50" : ""
-                          }`}
-                        >
-                          <div className="font-semibold text-gray-900 mb-0.5 flex items-center justify-between">
-                            <span>{n.title}</span>
-                            <span className="text-[10px] font-normal text-gray-400">
-                              {new Date(n.created_at).toLocaleTimeString([], {
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              })}
-                            </span>
-                          </div>
-                          <p className="text-gray-600 text-xs leading-relaxed">{n.message}</p>
-                        </div>
-                      ))
-                    )}
-                  </div>
+            {notificationsOpen ? (
+              <div className="absolute right-0 mt-2 w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
+                <div className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">
+                  <p className="text-xs font-bold uppercase tracking-wider text-gray-500">Notifications</p>
+                  {unreadCount > 0 ? (
+                    <button type="button" onClick={handleMarkAllRead} className="text-xs font-semibold text-indigo-600 hover:underline">
+                      Mark all read
+                    </button>
+                  ) : null}
                 </div>
-              )}
-            </div>
-
-            {/* User Profile Pill */}
-            {user && (
-              <div className="hidden sm:flex items-center gap-2 pl-2 border-l border-gray-200">
-                <div className="text-right">
-                  <div className="text-xs font-semibold text-gray-900 leading-tight">
-                    {user.full_name}
-                  </div>
-                  <div className="text-[10px] text-gray-500 capitalize">{user.role.replace("_", " ")}</div>
+                <div className="max-h-80 overflow-y-auto">
+                  {notifications.length === 0 ? (
+                    <p className="px-4 py-8 text-center text-xs text-gray-400">Nothing yet.</p>
+                  ) : (
+                    notifications.map((item) => (
+                      <article
+                        key={item.id}
+                        className={`border-b border-gray-50 px-4 py-2.5 last:border-0 ${item.is_read ? "" : "bg-indigo-50/50"}`}
+                      >
+                        <p className="text-xs font-semibold text-gray-900">{item.title}</p>
+                        <p className="mt-0.5 text-xs leading-relaxed text-gray-600">{item.message}</p>
+                        <p className="mt-1 text-[10px] text-gray-400">{formatRelative(item.created_at)}</p>
+                      </article>
+                    ))
+                  )}
                 </div>
               </div>
-            )}
+            ) : null}
+          </div>
 
-            {/* Logout */}
+          <div className="hidden items-center gap-2 rounded-full border border-gray-200 py-1 pl-3 pr-1 sm:flex">
+            <div className="text-right leading-tight">
+              <p className="text-xs font-semibold text-gray-900">{user.full_name}</p>
+              <p className="text-[10px] text-gray-500">{ROLE_LABELS[user.role]}</p>
+            </div>
             <button
+              type="button"
               onClick={logout}
-              title="Sign Out"
-              className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+              aria-label="Sign out"
+              className="grid h-7 w-7 place-items-center rounded-full text-gray-500 hover:bg-gray-100 hover:text-gray-900"
             >
-              <LogOut className="w-4 h-4" />
-            </button>
-
-            {/* Mobile menu toggle */}
-            <button
-              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-              className="md:hidden p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg"
-            >
-              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+              <LogOut className="h-4 w-4" aria-hidden />
             </button>
           </div>
-        </div>
-      </div>
 
-      {/* Mobile Menu Dropdown */}
-      {mobileMenuOpen && (
-        <div className="md:hidden border-t border-gray-200 bg-white px-4 pt-2 pb-4 space-y-1">
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen((open) => !open)}
+            aria-label="Menu"
+            aria-expanded={mobileMenuOpen}
+            className="grid h-9 w-9 place-items-center rounded-full text-gray-600 hover:bg-gray-100 md:hidden"
+          >
+            {mobileMenuOpen ? <X className="h-4.5 w-4.5" aria-hidden /> : <Menu className="h-4.5 w-4.5" aria-hidden />}
+          </button>
+        </div>
+      </nav>
+
+      {mobileMenuOpen ? (
+        <div className="border-t border-gray-100 px-4 py-2 md:hidden">
           {visibleLinks.map((link) => (
             <Link
               key={link.href}
               href={link.href}
-              onClick={() => setMobileMenuOpen(false)}
-              className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium ${
-                pathname === link.href
-                  ? "bg-indigo-50 text-indigo-700 font-semibold"
-                  : "text-gray-700 hover:bg-gray-100"
-              }`}
+              onClick={closeMenus}
+              className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-50"
             >
               {link.icon}
-              <span>{link.label}</span>
+              {link.label}
             </Link>
           ))}
+          <button
+            type="button"
+            onClick={logout}
+            className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            <LogOut className="h-4 w-4" aria-hidden />
+            Sign out ({user.full_name})
+          </button>
         </div>
-      )}
-    </nav>
+      ) : null}
+    </header>
   );
 };
-

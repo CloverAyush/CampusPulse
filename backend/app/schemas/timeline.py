@@ -1,8 +1,11 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional
 from datetime import datetime
-from app.models.enums import TimelineEventType, IssueStatus
-from app.schemas.user import UserOut
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict
+
+from app.models.enums import IssueStatus, TimelineEventType
+from app.schemas.user import UserPublic
+
 
 class TimelineEventOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -14,7 +17,5 @@ class TimelineEventOut(BaseModel):
     to_status: Optional[IssueStatus] = None
     title: str
     details: Optional[str] = None
-    metadata_json: Optional[str] = None
     created_at: datetime
-    actor: Optional[UserOut] = None
-
+    actor: Optional[UserPublic] = None

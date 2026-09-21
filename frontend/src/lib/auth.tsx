@@ -1,89 +1,139 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useState } from "react";
-import { User, UserRole } from "./types";
-import { api } from "./api";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
-interface AuthContextType {
+import { api, ApiError } from "./api";
+import { User, UserRole } from "./types";
+
+interface AuthContextValue {
   user: User | null;
-  loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  demoLogin: (role: UserRole) => Promise<void>;
+  status: "loading" | "authenticated" | "anonymous";
+  login: (email: string, password: string) => Promise<User>;
+  register: (data: {
+    email: string;
+    password: string;
+    full_name: string;
+    department?: string;
+  }) => Promise<User>;
   logout: () => void;
-  refreshUser: () => Promise<void>;
+  refresh: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [status, setStatus] = useState<AuthContextValue["status"]>("loading");
+  const router = useRouter();
 
-  const refreshUser = async () => {
+  const refresh = useCallback(async () => {
     try {
-      const userData = await api.getMe();
-      setUser(userData);
-    } catch {
-      setUser(null);
-      api.clearToken();
-    } finally {
-      setLoading(false);
+      const current = await api.getMe();
+      setUser(current);
+      setStatus("authenticated");
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.isAuthError) {
+        api.clearToken();
+        setUser(null);
+        setStatus("anonymous");
+      } else {
+        // The API is reachable but unhappy for another reason. Keep the session and
+        // let the page surface the failure rather than silently signing the user out.
+        setStatus(user ? "authenticated" : "anonymous");
+      }
     }
-  };
+  }, [user]);
 
   useEffect(() => {
-    // Attempt auto login from stored token, or fallback to default student demo if empty
-    const token = typeof window !== "undefined" ? localStorage.getItem("campuspulse_token") : null;
-    if (token) {
-      refreshUser();
-    } else {
-      // Default to student demo persona for immediate friction-free testing
-      api.demoLogin("student").then((res) => {
-        setUser(res.user);
-        setLoading(false);
-      }).catch(() => {
-        setLoading(false);
+    // In development, React Strict Mode runs this effect twice on mount (mount,
+    // cleanup, mount) to surface exactly this kind of bug: an earlier version of
+    // this guard used a ref to skip the second run, which meant the *only* fetch
+    // ever made got cancelled by the first run's cleanup and nothing replaced it —
+    // `status` stayed "loading" forever. Letting the effect run normally means the
+    // second mount simply starts its own fetch, which resolves fine. One extra
+    // request in dev only; production never double-invokes.
+    let cancelled = false;
+    api
+      .getMe()
+      .then((current) => {
+        if (cancelled) return;
+        setUser(current);
+        setStatus("authenticated");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        api.clearToken();
+        setUser(null);
+        setStatus("anonymous");
       });
-    }
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const login = async (email: string, password: string) => {
-    setLoading(true);
-    try {
-      const res = await api.login(email, password);
-      setUser(res.user);
-    } finally {
-      setLoading(false);
-    }
-  };
+  useEffect(() => {
+    api.setSessionExpiredHandler(() => {
+      setUser(null);
+      setStatus("anonymous");
+      router.replace("/login?expired=1");
+    });
+    return () => api.setSessionExpiredHandler(null);
+  }, [router]);
 
-  const demoLogin = async (role: UserRole) => {
-    setLoading(true);
-    try {
-      const res = await api.demoLogin(role);
-      setUser(res.user);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const login = useCallback(async (email: string, password: string) => {
+    const result = await api.login(email, password);
+    setUser(result.user);
+    setStatus("authenticated");
+    return result.user;
+  }, []);
 
-  const logout = () => {
+  const register = useCallback(
+    async (data: { email: string; password: string; full_name: string; department?: string }) => {
+      const result = await api.register(data);
+      setUser(result.user);
+      setStatus("authenticated");
+      return result.user;
+    },
+    []
+  );
+
+  const logout = useCallback(() => {
     api.clearToken();
     setUser(null);
-  };
+    setStatus("anonymous");
+    router.replace("/login");
+  }, [router]);
 
-  return (
-    <AuthContext.Provider value={{ user, loading, login, demoLogin, logout, refreshUser }}>
-      {children}
-    </AuthContext.Provider>
+  const value = useMemo(
+    () => ({ user, status, login, register, logout, refresh }),
+    [user, status, login, register, logout, refresh]
   );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
-export const useAuth = () => {
+export function useAuth(): AuthContextValue {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error("useAuth must be used within an AuthProvider");
-  }
+  if (!context) throw new Error("useAuth must be used inside AuthProvider");
   return context;
+}
+
+export function hasRole(user: User | null, ...roles: UserRole[]): boolean {
+  return user !== null && roles.includes(user.role);
+}
+
+export const ROLE_LABELS: Record<UserRole, string> = {
+  student: "Student",
+  handler: "Handler",
+  higher_authority: "Higher authority",
+  admin: "Administrator",
 };
 
+export const ROLE_HOME: Record<UserRole, string> = {
+  student: "/my-reports",
+  handler: "/handler",
+  higher_authority: "/higher-authority",
+  admin: "/admin",
+};

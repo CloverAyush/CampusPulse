@@ -1,8 +1,10 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text
+from sqlalchemy import Column, Enum, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
-from datetime import datetime
+
 from app.database import Base
+from app.models.base import TimestampColumn, utcnow
 from app.models.enums import ReportStatus
+
 
 class Report(Base):
     __tablename__ = "reports"
@@ -12,15 +14,13 @@ class Report(Base):
     reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     issue_type_id = Column(Integer, ForeignKey("issue_types.id"), nullable=False, index=True)
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=False, index=True)
-    specific_asset = Column(String(150), nullable=True) # e.g. "Ceiling Fan #2"
+    specific_asset = Column(String(150), nullable=True)
     description = Column(Text, nullable=False)
     photo_url = Column(String(500), nullable=True)
-    status = Column(Enum(ReportStatus), default=ReportStatus.SUBMITTED, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(Enum(ReportStatus, native_enum=False, length=40), default=ReportStatus.SUBMITTED, nullable=False)
+    created_at = Column(TimestampColumn, default=utcnow, nullable=False)
 
-    # Relationships
     issue = relationship("Issue", back_populates="reports")
     reporter = relationship("User", back_populates="reports", foreign_keys=[reporter_id])
     issue_type = relationship("IssueType", back_populates="reports")
     location = relationship("Location", back_populates="reports")
-

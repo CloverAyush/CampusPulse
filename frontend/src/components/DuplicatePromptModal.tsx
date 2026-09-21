@@ -1,125 +1,105 @@
 "use client";
 
 import React from "react";
+import { CheckCircle2, MapPin, Users } from "lucide-react";
+
+import { Modal } from "@/components/Modal";
+import { StatusBadge } from "@/components/StatusBadge";
+import { formatRelative, pluralise } from "@/lib/format";
 import { DuplicateIssueCandidate } from "@/lib/types";
-import { StatusBadge } from "./StatusBadge";
-import { AlertTriangle, Users, MapPin, Tag, ArrowRight, PlusCircle, ArrowLeft } from "lucide-react";
 
 interface DuplicatePromptModalProps {
-  isOpen: boolean;
+  open: boolean;
   candidates: DuplicateIssueCandidate[];
-  onConfirmJoin: (issueId: number) => void;
-  onCreateNew: () => void;
-  onCancel: () => void;
-  submitting?: boolean;
+  submitting: boolean;
+  onClose: () => void;
+  onJoin: (issueId: number) => void;
+  onCreateSeparate: () => void;
 }
 
+/** The suggestion is a suggestion. Nothing here merges anything automatically;
+ *  the student picks, and "this is a different problem" is always available. */
 export const DuplicatePromptModal: React.FC<DuplicatePromptModalProps> = ({
-  isOpen,
+  open,
   candidates,
-  onConfirmJoin,
-  onCreateNew,
-  onCancel,
-  submitting = false,
-}) => {
-  if (!isOpen || candidates.length === 0) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col border border-gray-100 overflow-hidden">
-        {/* Header */}
-        <div className="bg-amber-500/10 px-6 py-5 border-b border-amber-200/60 flex items-start gap-4">
-          <div className="p-3 bg-amber-500 text-white rounded-2xl shadow-md shadow-amber-500/20">
-            <AlertTriangle className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="text-lg font-bold text-gray-900">
-              Possible Existing Issue Detected
-            </h3>
-            <p className="text-xs text-amber-900/80 mt-1 leading-relaxed">
-              We found an active problem already reported at this exact location. Linking your report
-              strengthens the institutional priority instead of creating redundant tickets.
-            </p>
-          </div>
-        </div>
-
-        {/* Candidate List */}
-        <div className="p-6 overflow-y-auto space-y-4 flex-1">
-          <div className="text-xs font-semibold uppercase tracking-wider text-gray-400">
-            Matching Existing Active Issue(s)
-          </div>
-
-          {candidates.map((candidate) => (
-            <div
-              key={candidate.issue_id}
-              className="p-5 rounded-2xl border-2 border-indigo-100 bg-indigo-50/30 hover:border-indigo-300 transition-all space-y-3"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h4 className="text-base font-bold text-gray-900">
-                  {candidate.title}
-                </h4>
-                <StatusBadge status={candidate.status} size="sm" />
-              </div>
-
-              <div className="flex flex-wrap items-center gap-4 text-xs text-gray-600">
-                <div className="flex items-center gap-1.5 font-medium">
-                  <MapPin className="w-3.5 h-3.5 text-indigo-600" />
-                  <span>{candidate.location_name}</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Tag className="w-3.5 h-3.5 text-indigo-600" />
-                  <span>{candidate.issue_category} &rarr; {candidate.issue_sub_type}</span>
-                </div>
-                <div className="flex items-center gap-1.5 bg-indigo-100/70 text-indigo-800 px-2 py-0.5 rounded-full font-semibold">
-                  <Users className="w-3.5 h-3.5" />
-                  <span>{candidate.report_count} {candidate.report_count === 1 ? "student report" : "student reports"} linked</span>
-                </div>
-              </div>
-
-              <div className="text-xs text-gray-700 bg-white/80 p-3 rounded-xl border border-indigo-100/60 leading-relaxed">
-                <span className="font-semibold text-gray-900">Report details: </span>
-                {candidate.description}
-              </div>
-
-              <div className="pt-2 flex justify-end">
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => onConfirmJoin(candidate.issue_id)}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-xl shadow-md shadow-indigo-500/20 transition-all hover:translate-x-0.5"
-                >
-                  <span>Yes, This is the Same Issue (Link Report)</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
+  submitting,
+  onClose,
+  onJoin,
+  onCreateSeparate,
+}) => (
+  <Modal
+    open={open}
+    onClose={onClose}
+    wide
+    title="Someone may have already reported this"
+    description="If one of these is the same problem, add your report to it so the handler sees how many people it affects. If not, submit yours separately."
+  >
+    <div className="space-y-3">
+      {candidates.map((candidate) => (
+        <article
+          key={candidate.issue_id}
+          className={`rounded-2xl border p-4 ${candidate.asset_match ? "border-indigo-200 bg-indigo-50/40" : "border-gray-200"}`}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <p className="text-sm font-semibold text-gray-900">{candidate.title}</p>
+              <p className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-500">
+                <span className="inline-flex items-center gap-1">
+                  <MapPin className="h-3 w-3" aria-hidden />
+                  {candidate.location_name}
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <Users className="h-3 w-3" aria-hidden />
+                  {pluralise(candidate.affected_student_count, "student")} affected
+                </span>
+                <span>Reported {formatRelative(candidate.created_at)}</span>
+              </p>
             </div>
-          ))}
-        </div>
+            <StatusBadge status={candidate.status} />
+          </div>
 
-        {/* Footer Actions */}
-        <div className="bg-gray-50 px-6 py-4 border-t border-gray-100 flex flex-wrap items-center justify-between gap-3">
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={submitting}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-200/60 rounded-xl transition-colors"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span>Go Back & Edit</span>
-          </button>
+          <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-gray-600">{candidate.description}</p>
 
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={onCreateNew}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-gray-800 bg-white hover:bg-gray-100 border border-gray-300 rounded-xl shadow-sm transition-all"
-          >
-            <PlusCircle className="w-4 h-4 text-gray-500" />
-            <span>No, This is a Different Issue (Create New)</span>
-          </button>
-        </div>
+          {candidate.specific_asset ? (
+            <p className="mt-2 text-[11px] text-gray-500">
+              Reported against <span className="font-semibold">{candidate.specific_asset}</span>
+              {candidate.asset_match ? null : " — which is not the item you selected."}
+            </p>
+          ) : null}
+
+          <div className="mt-3">
+            {candidate.already_reported_by_you ? (
+              <p className="inline-flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1.5 text-[11px] font-semibold text-gray-600">
+                <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
+                You have already reported this one
+              </p>
+            ) : (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => onJoin(candidate.issue_id)}
+                className="rounded-full bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                This is the same problem
+              </button>
+            )}
+          </div>
+        </article>
+      ))}
+
+      <div className="flex flex-col gap-2 border-t border-gray-100 pt-4 sm:flex-row sm:justify-end">
+        <button type="button" onClick={onClose} className="rounded-full px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-100">
+          Go back
+        </button>
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={onCreateSeparate}
+          className="rounded-full border border-gray-300 px-5 py-2 text-sm font-semibold text-gray-800 hover:bg-gray-50 disabled:opacity-50"
+        >
+          {submitting ? "Submitting…" : "None of these — submit mine separately"}
+        </button>
       </div>
     </div>
-  );
-};
-
+  </Modal>
+);

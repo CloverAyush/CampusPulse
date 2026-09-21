@@ -1,88 +1,97 @@
 import json
-from tests.conftest import get_auth_headers
-from app.models.enums import IssueStatus, EvidenceType
 
-def test_escalation_flow_and_history_snapshot(client, seed_data):
-    """
-    Test handler escalation:
-    1. Student reports complex issue.
-    2. Handler marks in progress, realizes replacement budget requires Dean approval, and escalates.
-    3. Escalation record contains full case history snapshot.
-    4. Higher Authority views history timeline and resolves issue directly.
-    """
-    student_headers = get_auth_headers(seed_data["student_aarav"])
-    handler_headers = get_auth_headers(seed_data["facilities_handler"])
-    dean_headers = get_auth_headers(seed_data["dean_authority"])
+from app.models.enums import IssueStatus
+from tests.conftest import auth_headers
 
-    # 1. Student reports issue
-    resp_report = client.post(
-        "/api/v1/reports",
-        json={
-            "issue_type_id": seed_data["fan_type"].id,
-            "location_id": seed_data["room_204"].id,
-            "specific_asset": "Master Exhaust Fan",
-            "description": "Entire room exhaust motor has burned out and requires complete replacement."
-        },
-        headers=student_headers
-    )
-    issue_id = resp_report.json()["issue_id"]
 
-    # 2. Handler marks in progress
-    client.post(f"/api/v1/issues/{issue_id}/progress", headers=handler_headers)
+def _reported_issue(client, campus, submit_report):
+    issue_id = submit_report(campus["aarav"]).json()["issue_id"]
+    submit_report(campus["priya"], existing_issue_id=issue_id)
+    client.post(f"/api/v1/issues/{issue_id}/progress", headers=auth_headers(campus["facilities"]))
+    return issue_id
 
-    # 3. Handler attempts escalation with empty reason -> Should fail
-    resp_fail = client.post(
+
+def test_escalation_hands_over_the_complete_case(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+
+    response = client.post(
         f"/api/v1/issues/{issue_id}/escalate",
-        json={"reason": "   "},
-        headers=handler_headers
+        json={"reason": "Replacing the whole circuit needs a budget sanction beyond my authority"},
+        headers=auth_headers(campus["facilities"]),
     )
-    assert resp_fail.status_code == 400
 
-    # 4. Handler escalates with valid reason to Dean
-    escalate_reason = "Motor unit requires complete commercial replacement costing > 15,000 INR. Exceeds department approval threshold."
-    resp_escalate = client.post(
-        f"/api/v1/issues/{issue_id}/escalate",
-        json={
-            "reason": escalate_reason,
-            "escalated_to_id": seed_data["dean_authority"].id
-        },
-        headers=handler_headers
-    )
-    assert resp_escalate.status_code == 200
-    escalation_data = resp_escalate.json()
-    assert escalation_data["reason"] == escalate_reason
-    assert escalation_data["escalated_by_id"] == seed_data["facilities_handler"].id
-    assert escalation_data["escalated_to_id"] == seed_data["dean_authority"].id
+    assert response.status_code == 200
+    escalation = response.json()
+    assert escalation["escalated_to_id"] == campus["dean"].id
+    assert escalation["previous_status"] == IssueStatus.IN_PROGRESS.value
 
-    # Verify history snapshot exists and is valid JSON
-    assert escalation_data["history_snapshot"] is not None
-    snapshot = json.loads(escalation_data["history_snapshot"])
-    assert snapshot["issue_id"] == issue_id
-    assert len(snapshot["reports"]) >= 1
+    snapshot = json.loads(escalation["history_snapshot"])
+    assert snapshot["affected_student_count"] == 2
+    assert len(snapshot["reports"]) == 2
+    assert len(snapshot["timeline"]) >= 4
+    assert snapshot["location"] == "Room 204"
 
-    # 5. Verify issue status is now ESCALATED
-    resp_issue = client.get(f"/api/v1/issues/{issue_id}", headers=dean_headers)
-    assert resp_issue.json()["status"] == IssueStatus.ESCALATED.value
 
-    # 6. Dean views full chronological history
-    resp_history = client.get(f"/api/v1/issues/{issue_id}/history", headers=dean_headers)
-    assert resp_history.status_code == 200
-    timeline = resp_history.json()
-    event_types = [t["event_type"] for t in timeline]
-    assert "REPORT_SUBMITTED" in event_types
-    assert "ROUTED" in event_types
-    assert "STARTED_PROGRESS" in event_types
-    assert "ESCALATED" in event_types
+def test_the_authority_is_notified_and_sees_it_in_their_queue(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+    client.post(f"/api/v1/issues/{issue_id}/escalate",
+                json={"reason": "This requires an external vendor contract to be raised"},
+                headers=auth_headers(campus["facilities"]))
 
-    # 7. Dean resolves the escalated issue with executive procurement approval
-    resp_resolve = client.post(
+    notifications = client.get("/api/v1/notifications", headers=auth_headers(campus["dean"])).json()
+    queue = client.get("/api/v1/issues?scope=escalated", headers=auth_headers(campus["dean"])).json()
+
+    assert notifications["total"] == 1
+    assert queue["total"] == 1
+    assert queue["items"][0]["id"] == issue_id
+
+
+def test_affected_students_are_told_their_issue_was_escalated(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+    client.post(f"/api/v1/issues/{issue_id}/escalate",
+                json={"reason": "The rewiring work needs approval from the Dean's office"},
+                headers=auth_headers(campus["facilities"]))
+
+    for student in ("aarav", "priya"):
+        messages = client.get("/api/v1/notifications", headers=auth_headers(campus[student])).json()["items"]
+        assert any("escalated" in item["title"].lower() for item in messages)
+
+
+def test_an_issue_cannot_be_escalated_twice(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+    payload = {"reason": "This needs a budget sanction well beyond my authority"}
+
+    assert client.post(f"/api/v1/issues/{issue_id}/escalate", json=payload,
+                       headers=auth_headers(campus["facilities"])).status_code == 200
+    assert client.post(f"/api/v1/issues/{issue_id}/escalate", json=payload,
+                       headers=auth_headers(campus["facilities"])).status_code == 409
+
+
+def test_an_authority_can_resolve_an_escalated_issue(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+    client.post(f"/api/v1/issues/{issue_id}/escalate",
+                json={"reason": "Needs a vendor contract that only the Dean can authorise"},
+                headers=auth_headers(campus["facilities"]))
+
+    response = client.post(
         f"/api/v1/issues/{issue_id}/resolve",
-        json={
-            "evidence_type": EvidenceType.MAINTENANCE_RECORD.value,
-            "notes": "Deanery PO #4092 approved and replacement motor installed by vendor.",
-            "attachment_url": "https://example.com/po_4092.pdf"
-        },
-        headers=dean_headers
+        json={"evidence_type": "maintenance_record", "notes": "Vendor completed the rewiring, invoice attached."},
+        headers=auth_headers(campus["dean"]),
     )
-    assert resp_resolve.status_code == 200
 
+    assert response.status_code == 200
+
+
+def test_reassignment_takes_an_escalated_issue_back_into_progress(client, campus, submit_report):
+    issue_id = _reported_issue(client, campus, submit_report)
+    client.post(f"/api/v1/issues/{issue_id}/escalate",
+                json={"reason": "I do not have access to the electrical riser on this floor"},
+                headers=auth_headers(campus["facilities"]))
+
+    response = client.post(f"/api/v1/issues/{issue_id}/reassign",
+                           json={"handler_id": campus["it_handler"].id, "reason": "Riser access sits with IT"},
+                           headers=auth_headers(campus["dean"]))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == IssueStatus.IN_PROGRESS.value
+    assert response.json()["current_handler"]["full_name"] == "Amit Deshmukh"

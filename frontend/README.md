@@ -1,36 +1,32 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CampusPulse — frontend
 
-## Getting Started
-
-First, run the development server:
+Next.js App Router, TypeScript, Tailwind. The API it talks to lives in `../backend`.
 
 ```bash
+npm install
+cp .env.example .env.local     # NEXT_PUBLIC_API_URL
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Checks, both of which gate CI:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npx tsc --noEmit
+npx eslint src
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Setup, architecture and the product rules are in the root [README](../README.md).
 
-## Learn More
+## Layout
 
-To learn more about Next.js, take a look at the following resources:
+- `src/app/` — routes. `login`, `report`, `my-reports`, `handler`, `higher-authority`, `admin`, `issues/[id]`.
+- `src/components/` — shared UI, including the loading, empty and error states every page uses.
+- `src/lib/` — `api.ts` (typed client with a timeout and a single session-expiry path), `auth.tsx` (session context), `format.ts` (dates, labels, the https link guard).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Two conventions worth knowing before you add a page:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **A failed load must never look like an empty list.** Use `ErrorState`, not a
+  silent fallback. A handler seeing "nothing assigned" when the API is down is the
+  bug this codebase most wants to avoid.
+- **Data loads live inside the effect** with a `cancelled` guard, and reloads go
+  through a token, so a slow response cannot overwrite a newer one.

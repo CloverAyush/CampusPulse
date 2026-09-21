@@ -1,131 +1,228 @@
-# CampusPulse: Student Institutional Issues Reporting & Resolution Platform
+# CampusPulse
 
-CampusPulse is a production-grade full-stack web platform for colleges and universities to report, deterministically route, resolve with evidence, and verify non-personal institutional problems (electrical, plumbing, cleanliness, Wi-Fi, water supply, library facilities, etc.).
+A reporting and resolution system for shared campus problems: a broken fan in Room
+204, no Wi-Fi in the physics lab, an overflowing bin outside the canteen. Not for
+personal grievances or complaints about people.
 
----
-
-## 🏛️ Core Principles & Architecture
-
-### 1. REPORT vs ISSUE (First-Class Distinction)
-- **`REPORT`**: An individual student's submission.
-- **`ISSUE`**: The underlying campus institutional problem that $\ge 1$ reports point to.
-- *Example:* Three students in Room 204 report "fan broken" independently $\to$ Resolves to **1 Issue** with **3 linked Reports** and 3 affected students.
-
-### 2. Deterministic Existing-Issue Matching (No AI/ML or Silent Merges)
-- When a student begins a report, deterministic matching checks active issues matching `(IssueType + Location + Asset)`.
-- If a match is found, the system presents the existing issue and lets the student choose:
-  - **"Yes, link my report to this existing issue"**
-  - **"No, submit as a distinct new issue"**
-- The system **never** silently auto-merges reports.
-
-### 3. Deterministic Routing Rules
-- The institution configures deterministic lookup rules `(IssueType [+ Location]) -> Handler`.
-- Specific room/building rules take precedence over general campus-wide rules, with a global fallback.
-
-### 4. Verified Resolution vs Student Verification
-- **Institutional Resolution**: The assigned handler must attach verifiable proof (photo, action description, maintenance slip, or screenshot).
-- **Student Verification**: Affected students confirm or dispute that the problem is fixed. If disputed, the issue reopens automatically.
-- Verification requirement is configurable per issue type (e.g. Cleanliness auto-closes, Electrical requires verification).
-
-### 5. Audit-Grade Escalation
-- Handlers escalate issues with a stated reason (e.g., budget sanction $> 10,000$ INR or external vendor contract needed).
-- Higher authorities (Deans/Directors) receive the complete case history snapshot (original reports, photos, handler attempts, reasons) with zero summarization.
+The system exists because of a specific failure mode. A student reports something,
+it disappears into a WhatsApp group or a register at a desk, and nobody can say who
+owns it or whether it was ever fixed. CampusPulse answers three questions at every
+moment: **who owns this, what has happened to it, and is it actually fixed.**
 
 ---
 
-## 📦 Tech Stack
+## The four ideas the design rests on
 
-- **Backend**: FastAPI, SQLAlchemy ORM, Pydantic v2, SQLite (PostgreSQL-compatible portable schema), Alembic migrations, Pytest, PyJWT, bcrypt.
-- **Frontend**: Next.js (App Router), TypeScript, Tailwind CSS, Lucide Icons.
+**A report is not an issue.** A student submits a *report*. The problem itself is an
+*issue*. When three students report the same broken fan, that is one issue with
+three reports and three affected students, not three tickets in a queue. The
+distinction is what lets the system show a handler how many people a problem affects
+without anyone merging anything by hand.
+
+**Routing is deterministic and configured, never inferred.** There is no model
+guessing which department should fix something. An administrator writes rules, and
+a report is matched against them in a fixed order:
+
+| Order | Rule matches | Used when |
+|-------|--------------|-----------|
+| 1 | this issue type at this exact location | a rule was written for exactly this case |
+| 2 | this issue type at an ancestor location | nearest ancestor wins, so a building rule covers its rooms |
+| 3 | this issue type anywhere | a department owns this kind of problem campus-wide |
+| 4 | any issue type at this location | one person owns everything in this place |
+| 5 | any issue type at an ancestor location | as above, inherited down the hierarchy |
+| 6 | the catch-all rule | miscellaneous issues nothing else claims |
+| 7 | nothing matched | flagged for admin triage, administrators notified |
+
+Ties inside a step break by priority, then by rule id. The same inputs always
+produce the same handler, and an administrator can check any combination before a
+student finds the gap, using **Configuration → Routing rules → Preview**.
+
+Step 6 is the reason no report is ever silently orphaned. The catch-all rule is a
+routing rule with both dropdowns left on "Any", and the API refuses to delete it
+unless another one is configured to take its place.
+
+**Escalation is a judgement, not a timer.** Nothing escalates because a clock ran
+out. A handler escalates when the work is genuinely outside what they can authorise,
+and must say why. The authority receives the complete case: every report, all
+evidence, the full timeline, and the handler's stated reason. Nothing is summarised
+away.
+
+**Resolution requires evidence, and the students decide.** A handler cannot close an
+issue by asserting it is done. They record what they did, optionally with a link to
+a photo or work order. For issue types marked as requiring verification, the issue
+then sits in *awaiting confirmation* until an affected student responds. Confirming
+closes it. Disputing reopens it and sends it back, and the next resolution attempt
+is tracked as a separate round, so a pattern of "fixed" and "still broken" is
+visible rather than buried.
+
+The first affected student to respond settles it for everyone. That is a deliberate
+choice: waiting for unanimity means issues never close.
 
 ---
 
-## 🚀 Getting Started
+## Who sees what
 
-### 1. Backend Setup & Run
+| | Their own issues | All campus issues | Reporter names | Reporter contact details |
+|---|---|---|---|---|
+| Student who reported it | yes | yes | yes | no |
+| Student who did not | yes | yes | **no** | no |
+| Assigned handler | — | their queue | yes | **yes** |
+| Other handlers | — | — | yes | no |
+| Higher authority | — | escalation queue | yes | yes |
+| Administrator | — | everything | yes | yes |
+
+Students can browse every issue on campus, which is the point of a shared board, but
+a student who was not affected sees the reports without knowing who filed them.
+Timeline entries are rewritten too, since a title like "Reported by Aarav Sharma"
+would otherwise leak the name that the reporter field just hid.
+
+Contact details go only to the staff member actually assigned to the issue, because
+that is the person who may need to call someone. They are not in the general issue
+payload at all.
+
+---
+
+## Stack
+
+**Backend** — FastAPI, SQLAlchemy 2, Pydantic v2, Alembic, pytest. SQLite by
+default, Postgres supported. Authentication is JWT bearer tokens; passwords are
+bcrypt.
+
+**Frontend** — Next.js App Router, TypeScript, Tailwind. No component library; the
+UI is hand-written.
+
+Dependencies are pinned exactly in `backend/requirements.txt` and
+`frontend/package-lock.json`, and both are audited in CI.
+
+---
+
+## Running it
+
+### Backend
 
 ```bash
-# Navigate to backend
 cd backend
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
 
-# Create virtual environment (if not created)
-python -m venv venv
-
-# Activate virtual environment
-# Windows:
-venv\Scripts\activate
-# Linux/macOS:
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run migrations & seed realistic campus dataset
-python seeds.py
-
-# Start FastAPI server (runs on http://127.0.0.1:8000)
-uvicorn app.main:app --reload --port 8000
+cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # paste into SECRET_KEY
 ```
 
-FastAPI Interactive API Documentation:
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- ReDoc: `http://127.0.0.1:8000/redoc`
-
-### 2. Running Automated Tests
+`SECRET_KEY` has no default. The application will not start without one, and it
+refuses the key that used to be committed to this repository. See `SECURITY.md`.
 
 ```bash
-# In the backend directory with venv activated:
-pytest -v tests
+alembic upgrade head            # create the schema
+python -m scripts.seed          # optional: campus taxonomy, locations, routing rules
+python -m scripts.create_admin --email you@campus.edu --name "Your Name"
+uvicorn app.main:app --reload
 ```
 
-The test suite validates:
-1. Deterministic routing resolution with specificity precedence (`test_routing.py`)
-2. Deterministic duplicate suggestion and report linking (`test_duplicate_check.py`)
-3. Complete happy path: Report $\to$ In Progress $\to$ Resolve with Evidence $\to$ Student Confirm $\to$ Close (`test_report_resolve_verify.py`)
-4. Dispute/reopen path and auto-close policies (`test_report_resolve_verify.py`)
-5. Escalation flow with full history snapshot preservation (`test_escalation.py`)
+`scripts/seed.py` generates a **different random password for every account** and
+prints them once. There is no shared demo password and no seeding endpoint on the
+API; reference data is an operator's job, not a request anyone can send.
 
-### 3. Frontend Setup & Run
+API docs at `http://127.0.0.1:8000/docs` in development. They are disabled when
+`ENVIRONMENT=production`.
+
+### Frontend
 
 ```bash
-# Navigate to frontend
 cd frontend
-
-# Install packages
 npm install
-
-# Start Next.js development server (runs on http://localhost:3000)
+cp .env.example .env.local
 npm run dev
 ```
 
----
+### Tests
 
-## 👥 Demo Personas (1-Click Switcher Available in UI)
+```bash
+cd backend && python -m pytest          # 108 tests, about 3 seconds
+cd frontend && npx tsc --noEmit && npx eslint src
+```
 
-| Persona | Name | Role | Scope |
-| :--- | :--- | :--- | :--- |
-| **Student** | Aarav Sharma | `student` | Reports issues, tracks submitted reports, verifies resolutions |
-| **Facilities Handler** | Rajesh Sharma | `handler` | Receives Electrical & Facilities issues, starts work, resolves with evidence, escalates |
-| **IT Handler** | Amit Deshmukh | `handler` | Receives Wi-Fi & Network issues |
-| **Higher Authority** | Dr. K. Verma | `higher_authority` | Dean of Infrastructure; reviews escalated issues with full audit snapshots |
-| **Admin** | Administrator | `admin` | Manages issue types, locations, and deterministic routing lookup table |
+The test suite builds its schema by **running the real migrations**, so a model
+change without a matching migration fails the suite instead of failing a deployment.
 
 ---
 
-## 🌐 API Resource Endpoints
+## Configuration
 
-- `POST /api/v1/auth/login`, `POST /api/v1/auth/demo-login`, `GET /api/v1/auth/me`
-- `POST /api/v1/reports/check-duplicate` — Deterministic duplicate check
-- `POST /api/v1/reports` — Submit report (or link to existing issue)
-- `GET /api/v1/reports/my` — Student submitted reports
-- `GET /api/v1/issues` — Issues list filtered by role & status
-- `GET /api/v1/issues/{id}` — Full issue details with linked reports
-- `GET /api/v1/issues/{id}/history` — Chronological audit timeline
-- `POST /api/v1/issues/{id}/progress` — Handler starts progress
-- `POST /api/v1/issues/{id}/resolve` — Resolve with evidence
-- `POST /api/v1/issues/{id}/escalate` — Escalate with stated reason
-- `POST /api/v1/issues/{id}/verify` — Student confirms or disputes
-- `GET /api/v1/admin/taxonomies` — Available issue types, locations, handlers
-- `GET / POST / PUT /api/v1/admin/routing-rules` — Deterministic routing table
-- `POST /api/v1/admin/seed-data` — Reset database with demo data
+Everything lives in `backend/.env`. See `.env.example` for the full list.
 
+| Setting | Notes |
+|---|---|
+| `SECRET_KEY` | Required, minimum 32 characters, no default |
+| `ENVIRONMENT` | `development`, `staging` or `production` |
+| `DATABASE_URL` | SQLite or Postgres |
+| `CORS_ORIGINS` | Comma-separated. Rejected at startup if it contains `*` or `http://` when `ENVIRONMENT=production` |
+| `BCRYPT_ROUNDS` | Defaults to 12; must be at least 12 in production, enforced at startup |
+| `ALLOWED_ATTACHMENT_HOSTS` | Empty means any https host. Set it to restrict evidence links to your own domains |
+| `LOGIN_RATE_LIMIT_PER_MINUTE` | Also `REGISTER_RATE_LIMIT_PER_HOUR` and `WRITE_RATE_LIMIT_PER_MINUTE` |
+
+Production configuration is validated when settings load, not when something
+eventually breaks.
+
+---
+
+## Operating it
+
+**Logs** are structured JSON on stdout, one line per event, each carrying a
+`request_id`. Every API response carries the same id in the `X-Request-ID` header
+and inside any error body, so a student reporting "it did not work" hands you a
+string that maps to exactly one request. Set `LOG_JSON=false` for readable local
+output.
+
+**Health** is at `/health` (process is up) and `/ready` (database reachable). Point
+a load balancer at `/ready`.
+
+**Errors** are always the same shape, and never contain a stack trace:
+
+```json
+{"error": {"code": "invalid_transition", "message": "…", "request_id": "a1b2c3d4"}}
+```
+
+**Database choice.** SQLite is the default and is appropriate for a single campus
+deployment: the traffic is a few hundred reports a term, not a few hundred a second.
+It has one writer at a time, so concurrent writes queue rather than run in parallel,
+and it lives on one machine's disk, which makes backups a file copy and horizontal
+scaling impossible. Switching to Postgres is a `DATABASE_URL` change and
+`alembic upgrade head`. The code paths that differ between the two — row locking,
+connection pragmas — are already branched on the driver.
+
+**Known limits**, stated plainly:
+
+- The rate limiter keeps counters in process memory. With more than one worker the
+  effective limit multiplies by the worker count. Move the counters to Redis before
+  running more than one.
+- Notifications are in-app only. There is no email or SMS delivery.
+- There is no password reset flow. An administrator updates the account.
+- Evidence is a link to a file hosted elsewhere, not an upload.
+
+---
+
+## Layout
+
+```
+backend/
+  app/
+    api/v1/        auth, reports, issues, admin, notifications
+    models/        SQLAlchemy tables
+    schemas/       request and response models, with validation
+    services/      routing, duplicate suggestion, issue state machine
+    config.py      settings, validated at import
+    errors.py      domain exceptions the API maps to status codes
+    middleware.py  request ids, access logs, security headers
+  alembic/         migrations
+  scripts/         seed and admin bootstrap, run by an operator
+  tests/           routing, authorization matrix, privacy, lifecycle, validation
+frontend/
+  src/app/         routes
+  src/components/  shared UI
+  src/lib/         api client, auth context, formatting
+```
+
+The state machine lives in exactly one place, `services/issue_state_machine.py`,
+with the legal transitions written out as a table. Every action is checked against
+it, so an illegal move fails the same way no matter which route attempted it.
