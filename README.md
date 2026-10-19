@@ -60,6 +60,25 @@ choice: waiting for unanimity means issues never close.
 
 ---
 
+## What the seed data covers
+
+`python -m scripts.seed` loads six categories, each owned by a named handler through
+routing rules, plus the miscellaneous catch-all:
+
+| Category | Typical sub-types | Why it is shaped this way |
+|---|---|---|
+| Physical Infrastructure | benches, fans, lights, sockets, Wi-Fi, walkways | high frequency, low severity: it adds up if ignored |
+| Academic Resources | missing books, journal access, lab equipment | directly affects learning |
+| Food & Health | canteen hygiene, drinking water, medical room | health-critical, so verification is required |
+| Hostel & Accommodation | water or power outage, pests, overcrowding | quality of life; the warden owns anything inside a hostel block |
+| Safety & Social Environment | unsafe or dark zones, broken safety equipment | **non-personal only**, see below |
+| Extracurricular & Engagement | sports facilities, recreation equipment, event support | campus culture |
+
+**Out of scope on purpose:** ragging, harassment and bullying. They are personal,
+need anonymity and legal handling, and this platform shows handlers who reported an
+issue. Direct those to your anti-ragging committee or Internal Complaints Committee,
+not to a routing rule here.
+
 ## Who sees what
 
 | | Their own issues | All campus issues | Reporter names | Reporter contact details |
@@ -122,6 +141,13 @@ uvicorn app.main:app --reload
 `scripts/seed.py` generates a **different random password for every account** and
 prints them once. There is no shared demo password and no seeding endpoint on the
 API; reference data is an operator's job, not a request anyone can send.
+
+Lost a password? There is no recovery, only reset:
+
+```bash
+python -m scripts.reset_password --email someone@campus.edu            # prompts
+python -m scripts.reset_password --email someone@campus.edu --generate # random, printed once
+```
 
 API docs at `http://127.0.0.1:8000/docs` in development. They are disabled when
 `ENVIRONMENT=production`.
